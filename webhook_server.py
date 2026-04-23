@@ -272,6 +272,41 @@ def debug():
     return jsonify(_last_payload), 200
 
 
+@app.route("/debug/cert", methods=["GET"])
+def debug_cert():
+    """Diagnose cert mounting + mediaapi-v2 auth."""
+    info = {
+        "cert_path": str(CERT_FILE),
+        "key_path": str(KEY_FILE),
+        "cert_exists": CERT_FILE.exists(),
+        "key_exists": KEY_FILE.exists(),
+        "cert_size": CERT_FILE.stat().st_size if CERT_FILE.exists() else None,
+        "key_size": KEY_FILE.stat().st_size if KEY_FILE.exists() else None,
+        "cert_head": CERT_FILE.read_text()[:60] if CERT_FILE.exists() else None,
+        "key_head": KEY_FILE.read_text()[:40] if KEY_FILE.exists() else None,
+        "api_key_set": bool(RHOMBUS_API_KEY),
+        "api_key_len": len(RHOMBUS_API_KEY),
+    }
+    # Try a test call to mediaapi-v2 with + without cert
+    test_url = "https://mediaapi-v2.rhombussystems.com/media/metadata/us-east-2/test.jpeg"
+    try:
+        r = requests.get(test_url,
+            headers={"X-Auth-Apikey": RHOMBUS_API_KEY, "X-Auth-Scheme": "api"},
+            cert=_cert(), verify=False, timeout=10)
+        info["media_with_cert_status"] = r.status_code
+        info["media_with_cert_body"] = r.text[:200]
+    except Exception as e:
+        info["media_with_cert_error"] = str(e)
+    try:
+        r = requests.get(test_url,
+            headers={"X-Auth-Apikey": RHOMBUS_API_KEY, "X-Auth-Scheme": "api"},
+            verify=False, timeout=10)
+        info["media_no_cert_status"] = r.status_code
+    except Exception as e:
+        info["media_no_cert_error"] = str(e)[:200]
+    return jsonify(info), 200
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global _last_payload
