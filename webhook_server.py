@@ -287,23 +287,29 @@ def debug_cert():
         "api_key_set": bool(RHOMBUS_API_KEY),
         "api_key_len": len(RHOMBUS_API_KEY),
     }
-    # Try a test call to mediaapi-v2 with + without cert
-    test_url = "https://mediaapi-v2.rhombussystems.com/media/metadata/us-east-2/test.jpeg"
+    # Probe a grid of mediaapi-v2 URL shapes to find which one auths cleanly
+    probes = {
+        "metadata_fake":  "https://mediaapi-v2.rhombussystems.com/media/metadata/us-east-2/test.jpeg",
+        "frame_real":     "https://mediaapi-v2.rhombussystems.com/media/frame/1gKR-iBAQfmANqoQ9Nutjw/1776965936142/thumb.jpeg?d=1",
+        "metadata_real":  "https://mediaapi-v2.rhombussystems.com/media/metadata/us-east-2/6LZ4SfTcRCuc-Df0OpuolQ.jpeg",
+    }
+    info["probes"] = {}
+    for name, url in probes.items():
+        try:
+            r = requests.get(url,
+                headers={"X-Auth-Apikey": RHOMBUS_API_KEY, "X-Auth-Scheme": "api"},
+                cert=_cert(), verify=False, timeout=10)
+            info["probes"][name] = {"status": r.status_code, "body": r.text[:150]}
+        except Exception as e:
+            info["probes"][name] = {"error": str(e)[:200]}
+    # also probe without cert for handshake confirmation
     try:
-        r = requests.get(test_url,
-            headers={"X-Auth-Apikey": RHOMBUS_API_KEY, "X-Auth-Scheme": "api"},
-            cert=_cert(), verify=False, timeout=10)
-        info["media_with_cert_status"] = r.status_code
-        info["media_with_cert_body"] = r.text[:200]
-    except Exception as e:
-        info["media_with_cert_error"] = str(e)
-    try:
-        r = requests.get(test_url,
+        r = requests.get(probes["metadata_fake"],
             headers={"X-Auth-Apikey": RHOMBUS_API_KEY, "X-Auth-Scheme": "api"},
             verify=False, timeout=10)
-        info["media_no_cert_status"] = r.status_code
+        info["no_cert_status"] = r.status_code
     except Exception as e:
-        info["media_no_cert_error"] = str(e)[:200]
+        info["no_cert_error"] = str(e)[:150]
     return jsonify(info), 200
 
 
