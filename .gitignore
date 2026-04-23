@@ -4,6 +4,15 @@ detections.csv
 __pycache__/
 *.pyc
 
+# Secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.crt
+secrets/
+.secrets/
+
 # Test images
 Snip*.png
 *_detected.jpeg

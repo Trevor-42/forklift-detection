@@ -36,7 +36,30 @@ HOME_KEY  = Path.home() / ".rhombus/certs/i2M/client.key"
 if not HOME_CERT.exists() or not HOME_KEY.exists():
     sys.exit(f"Missing local certs at {HOME_CERT.parent}. Run `rhombus login --profile i2M` first.")
 
-os.environ.setdefault("RHOMBUS_API_KEY", "lZU-w_6JQ9eE7CaNJ9UZXA")
+# Load .env (local untracked file) if present so we don't hard-code secrets.
+_ENV_FILE = Path(__file__).parent / ".env"
+if _ENV_FILE.exists():
+    for _line in _ENV_FILE.read_text().splitlines():
+        _line = _line.strip()
+        if not _line or _line.startswith("#") or "=" not in _line:
+            continue
+        _k, _v = _line.split("=", 1)
+        os.environ.setdefault(_k.strip(), _v.strip().strip('"').strip("'"))
+
+# Fallback: try the i2M profile's credentials file (written by `rhombus configure`).
+if not os.environ.get("RHOMBUS_API_KEY"):
+    _creds = Path.home() / ".rhombus/credentials"
+    if _creds.exists():
+        import configparser
+        _cp = configparser.ConfigParser()
+        _cp.read(_creds)
+        for _profile in ("i2M", "default"):
+            if _cp.has_option(_profile, "api_key"):
+                os.environ["RHOMBUS_API_KEY"] = _cp.get(_profile, "api_key")
+                break
+
+if not os.environ.get("RHOMBUS_API_KEY"):
+    sys.exit("RHOMBUS_API_KEY is not set. Put it in .env (gitignored), export it, or run `rhombus configure --profile i2M`.")
 
 # Patch the hardcoded cert paths inside webhook_server
 import webhook_server as ws
