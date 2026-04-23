@@ -108,6 +108,44 @@ def download_media(url: str) -> Path | None:
     return None
 
 
+_CLI_ENV_READY = False
+
+
+def _cli_env() -> dict:
+    """Prepare a subprocess env for the `rhombus` CLI.
+
+    The CLI looks for certs at ~/.rhombus/certs/<profile>/client.{crt,key} and
+    reads HOME for that path. We point HOME at /tmp and copy our mounted secrets
+    into the expected location once per process.
+    """
+    global _CLI_ENV_READY
+    env = {
+        "HOME":            "/tmp",
+        "RHOMBUS_API_KEY": RHOMBUS_API_KEY,
+        "PATH":            "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+    }
+    if _CLI_ENV_READY:
+        return env
+    try:
+        config_dir = Path("/tmp/.rhombus")
+        cert_dir   = config_dir / "certs" / "default"
+        cert_dir.mkdir(parents=True, exist_ok=True)
+        if CERT_FILE.exists() and KEY_FILE.exists():
+            import shutil
+            shutil.copy(CERT_FILE, cert_dir / "client.crt")
+            shutil.copy(KEY_FILE,  cert_dir / "client.key")
+        (config_dir / "credentials").write_text(
+            "[default]\nauth_type = cert\n"
+            f"api_key = {RHOMBUS_API_KEY}\n"
+            f"key_file = {cert_dir}/client.key\n"
+            f"cert_file = {cert_dir}/client.crt\n"
+        )
+        _CLI_ENV_READY = True
+    except Exception as e:
+        log.warning(f"CLI env setup failed: {e}")
+    return env
+
+
 def download_via_cli(event_uuid: str) -> Path | None:
     """Use the rhombus CLI to download an alert thumbnail — handles all auth internally."""
     if not event_uuid:
@@ -115,31 +153,9 @@ def download_via_cli(event_uuid: str) -> Path | None:
     try:
         tmp = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
         tmp.close()
-        # Configure CLI via environment variables pointing to our mounted secrets
-        env = {
-            "HOME": "/tmp",  # so CLI writes config to /tmp/.rhombus/
-            "RHOMBUS_API_KEY": RHOMBUS_API_KEY,
-            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
-        }
-        # Write a minimal rhombus config using the mounted cert files
-        config_dir = Path("/tmp/.rhombus")
-        config_dir.mkdir(parents=True, exist_ok=True)
-        cert_dir = config_dir / "certs" / "default"
-        cert_dir.mkdir(parents=True, exist_ok=True)
-        if CERT_FILE.exists():
-            import shutil
-            shutil.copy(CERT_FILE, cert_dir / "client.crt")
-            shutil.copy(KEY_FILE, cert_dir / "client.key")
-        (config_dir / "credentials").write_text(
-            "[default]\nauth_type = cert\n"
-            f"api_key = {RHOMBUS_API_KEY}\n"
-            f"key_file = {cert_dir}/client.key\n"
-            f"cert_file = {cert_dir}/client.crt\n"
-        )
-        import subprocess as sp
-        result = sp.run(
+        result = subprocess.run(
             ["rhombus", "alert", "thumb", event_uuid, "--output", tmp.name],
-            env=env, capture_output=True, text=True, timeout=30,
+            env=_cli_env(), capture_output=True, text=True, timeout=30,
         )
         path = Path(tmp.name)
         if path.exists() and path.stat().st_size > 1000:
@@ -148,6 +164,35 @@ def download_via_cli(event_uuid: str) -> Path | None:
         log.warning(f"CLI thumb failed: {result.stderr[:200]}")
     except Exception as e:
         log.warning(f"CLI download exception: {e}")
+    return None
+
+
+def download_via_analyze(camera_uuid: str, timestamp_ms: int, window_ms: int = 3000) -> Path | None:
+    """Use `rhombus analyze footage --fill --raw` to pull a frame near timestamp_ms.
+
+    The CLI calls video/getExactFrameUri under the hood and downloads the
+    resulting dash-internal URL with the right TLS client config — something
+    Python requests can't reproduce (403s). Reads from recorded footage so it
+    works even when the webhook's ephemeral thumbnail cache has evicted.
+    """
+    tmpdir = tempfile.mkdtemp(prefix="frame-")
+    try:
+        result = subprocess.run(
+            ["rhombus", "analyze", "footage", camera_uuid,
+             "--start", str(timestamp_ms),
+             "--end",   str(timestamp_ms + window_ms),
+             "--fill", "--raw", "--output", tmpdir],
+            env=_cli_env(), capture_output=True, text=True, timeout=45,
+        )
+        for p in sorted(Path(tmpdir).rglob("*.jpeg")):
+            if p.stat().st_size > 1000:
+                log.info(f"Fetched frame via rhombus analyze: {p.stat().st_size} bytes")
+                return p
+        log.warning(f"rhombus analyze produced no frames. stderr: {result.stderr[:300]}")
+    except subprocess.TimeoutExpired:
+        log.warning("rhombus analyze timed out")
+    except Exception as e:
+        log.warning(f"rhombus analyze exception: {e}")
     return None
 
 
@@ -180,26 +225,6 @@ def refresh_tu_url(camera_uuid: str, timestamp_ms: int, window_sec: int = 10) ->
         return ""
 
 
-def get_exact_frame_uri(camera_uuid: str, timestamp_ms: int) -> str:
-    """Ask Rhombus for a URI to the exact recorded frame at timestamp_ms.
-
-    Unlike thumbnail `tu` URLs (ephemeral in-memory cache), this reads from
-    recorded footage on disk, so it works even when the webhook lands long
-    after the event.
-    """
-    try:
-        resp = rhombus_post("video/getExactFrameUri", {
-            "cameraUuid":  f"{camera_uuid}.v0",
-            "timestampMs": timestamp_ms,
-        })
-        if isinstance(resp, dict) and not resp.get("error") and resp.get("frameUri"):
-            return resp["frameUri"]
-        log.info(f"getExactFrameUri: {resp.get('responseMessage') if isinstance(resp, dict) else resp}")
-    except Exception as e:
-        log.warning(f"getExactFrameUri failed: {e}")
-    return ""
-
-
 def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
               region: str = "us-east-2", seekpoint_tu: str = "") -> Path | None:
     """Get a frame for YOLO — tries multiple strategies in decreasing freshness."""
@@ -208,18 +233,17 @@ def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
         frame = download_media(seekpoint_tu)
         if frame:
             return frame
-        log.info("Webhook tu URL expired — falling back to getExactFrameUri")
+        log.info("Webhook tu URL expired — falling back to rhombus analyze")
 
-    # Strategy 2: getExactFrameUri — pulls exact frame from recorded footage.
-    # Robust against thumbnail-cache eviction; works for any ts in retention.
-    exact_uri = get_exact_frame_uri(camera_uuid, timestamp_ms)
-    if exact_uri:
-        frame = download_media(exact_uri)
-        if frame:
-            log.info("Fetched frame via getExactFrameUri")
-            return frame
+    # Strategy 2: shell out to `rhombus analyze footage` — reads from recorded
+    # footage via video/getExactFrameUri. Works even after the thumbnail cache
+    # has evicted, because the CLI's Go HTTP client can talk to the
+    # .dash-internal.rhombussystems.com endpoint that Python requests cannot.
+    frame = download_via_analyze(camera_uuid, timestamp_ms)
+    if frame:
+        return frame
 
-    # Strategy 3: rhombus CLI (works only for promoted alert UUIDs)
+    # Strategy 3: rhombus alert thumb (works only for promoted alert UUIDs)
     frame = download_via_cli(event_uuid)
     if frame:
         return frame
