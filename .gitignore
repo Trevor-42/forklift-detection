@@ -1,0 +1,12 @@
+venv/
+*.DS_Store
+detections.csv
+__pycache__/
+*.pyc
+
+# Test images
+Snip*.png
+*_detected.jpeg
+*_detected.png
+blog-*.jpeg
+for-4-main-functions-*.jpg
