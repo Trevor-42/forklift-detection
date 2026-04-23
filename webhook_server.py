@@ -13,6 +13,7 @@ Environment variables required:
   RHOMBUS_API_KEY   — i2M org API key
   WEBHOOK_SECRET    — optional shared secret to verify requests
 """
+from __future__ import annotations
 
 import csv
 import json
@@ -116,7 +117,7 @@ def download_via_cli(event_uuid: str) -> Path | None:
         env = {
             "HOME": "/tmp",  # so CLI writes config to /tmp/.rhombus/
             "RHOMBUS_API_KEY": RHOMBUS_API_KEY,
-            "PATH": "/usr/local/bin:/usr/bin:/bin",
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
         }
         # Write a minimal rhombus config using the mounted cert files
         config_dir = Path("/tmp/.rhombus")
