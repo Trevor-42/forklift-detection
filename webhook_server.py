@@ -25,7 +25,10 @@ from datetime import datetime
 from pathlib import Path
 
 import requests
+import urllib3
 from flask import Flask, request, jsonify
+
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 from PIL import Image
 from ultralytics import YOLO
 
@@ -34,13 +37,23 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-WEIGHTS        = Path(__file__).parent / "best.pt"
-LOG_FILE       = Path(__file__).parent / "detections.csv"
-THRESHOLD      = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.80"))
+WEIGHTS         = Path(__file__).parent / "best.pt"
+LOG_FILE        = Path(__file__).parent / "detections.csv"
+THRESHOLD       = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.70"))
 RHOMBUS_API_KEY = os.environ.get("RHOMBUS_API_KEY", "")
-RHOMBUS_API    = "https://api2.rhombussystems.com/api"
+RHOMBUS_API     = "https://api2.rhombussystems.com/api"
+MEDIA_API       = "https://mediaapi-v2.rhombussystems.com"
+CERT_FILE       = Path("/run/secrets/crt/client-crt")
+KEY_FILE        = Path("/run/secrets/key/client-key")
 
 model = None
+
+
+def _cert():
+    """Return (cert, key) tuple if available, else None."""
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        return (str(CERT_FILE), str(KEY_FILE))
+    return None
 
 
 def get_model():
@@ -58,28 +71,100 @@ def rhombus_post(endpoint: str, payload: dict):
         json=payload,
         headers={
             "X-Auth-Apikey": RHOMBUS_API_KEY,
-            "X-Auth-Scheme": "api-token",
+            "X-Auth-Scheme": "api",
         },
+        cert=_cert(),
+        verify=False,
         timeout=10,
     )
     return resp.json()
 
 
-def download_thumbnail(alert_uuid: str):
-    """Download alert thumbnail, return path to temp file or None."""
+def download_media(url: str) -> Path | None:
+    """Download an image from a Rhombus media URL using mTLS client cert."""
     try:
-        data = rhombus_post("event/getPolicyAlertDetails", {"policyAlertUuid": alert_uuid})
-        alert = data.get("policyAlert", {})
-        region = alert.get("thumbnailLocation", {}).get("region", "us-east-2")
-        url = f"https://mediaapi-v2.rhombussystems.com/media/metadata/{region}/{alert_uuid}.jpeg"
-        resp = requests.get(url, headers={"X-Auth-Apikey": RHOMBUS_API_KEY}, timeout=10)
+        full_url = url if url.startswith("http") else f"{MEDIA_API}{url}"
+        resp = requests.get(
+            full_url,
+            headers={"X-Auth-Apikey": RHOMBUS_API_KEY},
+            cert=_cert(),
+            verify=False,
+            timeout=15,
+        )
         if resp.status_code == 200 and len(resp.content) > 1000:
             tmp = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
             tmp.write(resp.content)
             tmp.close()
             return Path(tmp.name)
+        log.warning(f"Media download HTTP {resp.status_code} for {full_url}")
     except Exception as e:
-        log.warning(f"Thumbnail download failed: {e}")
+        log.warning(f"Media download failed: {e}")
+    return None
+
+
+def download_via_cli(event_uuid: str) -> Path | None:
+    """Use the rhombus CLI to download an alert thumbnail — handles all auth internally."""
+    if not event_uuid:
+        return None
+    try:
+        tmp = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
+        tmp.close()
+        # Configure CLI via environment variables pointing to our mounted secrets
+        env = {
+            "HOME": "/tmp",  # so CLI writes config to /tmp/.rhombus/
+            "RHOMBUS_API_KEY": RHOMBUS_API_KEY,
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
+        }
+        # Write a minimal rhombus config using the mounted cert files
+        config_dir = Path("/tmp/.rhombus")
+        config_dir.mkdir(parents=True, exist_ok=True)
+        cert_dir = config_dir / "certs" / "default"
+        cert_dir.mkdir(parents=True, exist_ok=True)
+        if CERT_FILE.exists():
+            import shutil
+            shutil.copy(CERT_FILE, cert_dir / "client.crt")
+            shutil.copy(KEY_FILE, cert_dir / "client.key")
+        (config_dir / "credentials").write_text(
+            "[default]\nauth_type = cert\n"
+            f"api_key = {RHOMBUS_API_KEY}\n"
+            f"key_file = {cert_dir}/client.key\n"
+            f"cert_file = {cert_dir}/client.crt\n"
+        )
+        import subprocess as sp
+        result = sp.run(
+            ["rhombus", "alert", "thumb", event_uuid, "--output", tmp.name],
+            env=env, capture_output=True, text=True, timeout=30,
+        )
+        path = Path(tmp.name)
+        if path.exists() and path.stat().st_size > 1000:
+            log.info(f"CLI thumbnail download succeeded ({path.stat().st_size} bytes)")
+            return path
+        log.warning(f"CLI thumb failed: {result.stderr[:200]}")
+    except Exception as e:
+        log.warning(f"CLI download exception: {e}")
+    return None
+
+
+def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
+              region: str = "us-east-2", seekpoint_tu: str = "") -> Path | None:
+    """Get a frame for YOLO — tries CLI auth first, then direct media download."""
+    # Primary: rhombus CLI handles all Rhombus auth natively
+    frame = download_via_cli(event_uuid)
+    if frame:
+        return frame
+
+    # Fallback: direct media download with cert
+    if seekpoint_tu:
+        frame = download_media(seekpoint_tu)
+        if frame:
+            return frame
+
+    if event_uuid:
+        frame = download_media(f"{MEDIA_API}/media/metadata/{region}/{event_uuid}.jpeg")
+        if frame:
+            return frame
+
+    log.warning("All image fetch methods failed.")
     return None
 
 
@@ -102,7 +187,7 @@ def create_seekpoint(camera_uuid: str, timestamp_ms: int):
         "footageSeekPoints": [{
             "timestampMs": timestamp_ms,
             "name": "Forklift Movement",
-            "color": "BLUE",
+            "color": "GREEN",
         }]
     })
 
@@ -139,50 +224,68 @@ def log_detection(camera_uuid: str, alert_uuid: str, detections: list):
 
 
 def parse_payload(payload: dict):
-    """Extract camera_uuid, event_uuid, timestamp_ms from either alert or rules engine payload."""
-    # Rules Engine payload
+    """Extract (camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu) from any Rhombus webhook format."""
+    # Rules Engine deviceEvents format
+    if "deviceEvents" in payload:
+        events = payload["deviceEvents"]
+        if not events:
+            return None, None, int(time.time() * 1000), "us-east-2", ""
+        event = events[0]
+        camera_uuid  = event.get("deviceUuid", "").split(".")[0]  # strip .v0 suffix if present
+        event_uuid   = event.get("eventUuid") or event.get("uuid")
+        timestamp_ms = event.get("timestampMs", payload.get("triggeredTimestampMs", int(time.time() * 1000)))
+        region       = event.get("thumbnailLocation", {}).get("region", "us-east-2")
+        # Pick the best seekpoint thumbnail — prefer MOTION_CAR frames
+        seekpoint_tu = ""
+        for sp in event.get("seekpoints", []):
+            if sp.get("tu") and sp.get("activity") == "MOTION_CAR":
+                seekpoint_tu = sp["tu"]
+                break
+        if not seekpoint_tu:
+            for sp in event.get("seekpoints", []):
+                if sp.get("tu"):
+                    seekpoint_tu = sp["tu"]
+                    break
+        return camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu
+
+    # Legacy triggerEvent format
     if "triggerEvent" in payload:
-        event      = payload["triggerEvent"]
-        camera_uuid = event.get("deviceUuid") or event.get("cameraUuid")
-        event_uuid  = event.get("uuid") or event.get("eventUuid") or payload.get("ruleUuid")
+        event        = payload["triggerEvent"]
+        camera_uuid  = event.get("deviceUuid") or event.get("cameraUuid")
+        event_uuid   = event.get("uuid") or event.get("eventUuid") or payload.get("ruleUuid")
         timestamp_ms = event.get("timestampMs", int(time.time() * 1000))
-        return camera_uuid, event_uuid, timestamp_ms
+        return camera_uuid, event_uuid, timestamp_ms, "us-east-2", ""
 
     # Policy alert payload
     camera_uuid  = payload.get("deviceUuid") or payload.get("cameraUuid")
     event_uuid   = payload.get("policyAlertUuid") or payload.get("uuid")
     timestamp_ms = payload.get("timestampMs", int(time.time() * 1000))
-    return camera_uuid, event_uuid, timestamp_ms
+    return camera_uuid, event_uuid, timestamp_ms, "us-east-2", ""
+
+
+_last_payload: dict = {}
+
+
+@app.route("/debug", methods=["GET"])
+def debug():
+    return jsonify(_last_payload), 200
 
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
+    global _last_payload
     payload = request.get_json(silent=True) or {}
-    log.info(f"Webhook received: {json.dumps(payload)[:400]}")
+    _last_payload = payload
+    log.info(f"Webhook received: {json.dumps(payload)}")
 
-    camera_uuid, event_uuid, timestamp_ms = parse_payload(payload)
+    camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu = parse_payload(payload)
 
     if not camera_uuid:
         return jsonify({"status": "ignored", "reason": "no camera uuid"}), 200
 
-    log.info(f"Vehicle event on camera {camera_uuid} — running detection...")
+    log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
 
-    thumb = download_thumbnail(event_uuid) if event_uuid else None
-    if not thumb:
-        # Fall back to grabbing a fresh frame at the event timestamp
-        log.warning("No thumbnail — attempting frame via exact URI...")
-        try:
-            frame_data = rhombus_post("video/getExactFrameUri", {"cameraUuid": camera_uuid, "timestampMs": timestamp_ms})
-            frame_url  = frame_data.get("frameUri")
-            if frame_url:
-                resp = requests.get(frame_url, timeout=10)
-                if resp.status_code == 200:
-                    tmp = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
-                    tmp.write(resp.content)
-                    tmp.close()
-                    thumb = Path(tmp.name)
-        except Exception as e:
-            log.warning(f"Frame fallback failed: {e}")
+    thumb = get_frame(camera_uuid, timestamp_ms, event_uuid or "", region, seekpoint_tu)
 
     if not thumb or not thumb.exists():
         log.warning("Could not obtain image.")
