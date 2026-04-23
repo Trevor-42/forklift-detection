@@ -20,6 +20,7 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -137,28 +138,55 @@ def log_detection(camera_uuid: str, alert_uuid: str, detections: list):
             writer.writerow([datetime.now().isoformat(), camera_uuid, alert_uuid, label, f"{conf:.1%}"])
 
 
+def parse_payload(payload: dict):
+    """Extract camera_uuid, event_uuid, timestamp_ms from either alert or rules engine payload."""
+    # Rules Engine payload
+    if "triggerEvent" in payload:
+        event      = payload["triggerEvent"]
+        camera_uuid = event.get("deviceUuid") or event.get("cameraUuid")
+        event_uuid  = event.get("uuid") or event.get("eventUuid") or payload.get("ruleUuid")
+        timestamp_ms = event.get("timestampMs", int(time.time() * 1000))
+        return camera_uuid, event_uuid, timestamp_ms
+
+    # Policy alert payload
+    camera_uuid  = payload.get("deviceUuid") or payload.get("cameraUuid")
+    event_uuid   = payload.get("policyAlertUuid") or payload.get("uuid")
+    timestamp_ms = payload.get("timestampMs", int(time.time() * 1000))
+    return camera_uuid, event_uuid, timestamp_ms
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     payload = request.get_json(silent=True) or {}
-    log.info(f"Webhook received: {json.dumps(payload)[:300]}")
+    log.info(f"Webhook received: {json.dumps(payload)[:400]}")
 
-    alert_uuid  = payload.get("policyAlertUuid") or payload.get("uuid") or payload.get("alertUuid")
-    camera_uuid = payload.get("deviceUuid") or payload.get("cameraUuid")
-    triggers    = payload.get("policyAlertTriggers", [])
-    timestamp_ms = payload.get("timestampMs", 0)
+    camera_uuid, event_uuid, timestamp_ms = parse_payload(payload)
 
-    if not alert_uuid:
-        return jsonify({"status": "ignored", "reason": "no alert uuid"}), 200
+    if not camera_uuid:
+        return jsonify({"status": "ignored", "reason": "no camera uuid"}), 200
 
-    if "MOTION_CAR" not in triggers:
-        return jsonify({"status": "ignored", "reason": "not a vehicle alert"}), 200
+    log.info(f"Vehicle event on camera {camera_uuid} — running detection...")
 
-    log.info(f"Vehicle alert {alert_uuid[:8]} on camera {camera_uuid} — running detection...")
-
-    thumb = download_thumbnail(alert_uuid)
+    thumb = download_thumbnail(event_uuid) if event_uuid else None
     if not thumb:
-        log.warning("Could not download thumbnail.")
-        return jsonify({"status": "error", "reason": "thumbnail unavailable"}), 200
+        # Fall back to grabbing a fresh frame at the event timestamp
+        log.warning("No thumbnail — attempting frame via exact URI...")
+        try:
+            frame_data = rhombus_post("video/getExactFrameUri", {"cameraUuid": camera_uuid, "timestampMs": timestamp_ms})
+            frame_url  = frame_data.get("frameUri")
+            if frame_url:
+                resp = requests.get(frame_url, timeout=10)
+                if resp.status_code == 200:
+                    tmp = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
+                    tmp.write(resp.content)
+                    tmp.close()
+                    thumb = Path(tmp.name)
+        except Exception as e:
+            log.warning(f"Frame fallback failed: {e}")
+
+    if not thumb or not thumb.exists():
+        log.warning("Could not obtain image.")
+        return jsonify({"status": "error", "reason": "image unavailable"}), 200
 
     detections = run_detection(thumb)
     forklifts  = [d for d in detections if d[0] == "forklift"]
@@ -168,7 +196,7 @@ def webhook():
         return jsonify({"status": "ok", "forklift": False}), 200
 
     log.info(f"Forklift detected! {len(forklifts)} instance(s). Creating annotations...")
-    log_detection(camera_uuid, alert_uuid, forklifts)
+    log_detection(camera_uuid, event_uuid or "", forklifts)
     create_seekpoint(camera_uuid, timestamp_ms)
     create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
 
