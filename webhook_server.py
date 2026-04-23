@@ -15,12 +15,14 @@ Environment variables required:
 """
 from __future__ import annotations
 
+import collections
 import csv
 import json
 import logging
 import os
 import subprocess
 import tempfile
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -276,6 +278,17 @@ def parse_payload(payload: dict):
 
 _last_payload: dict = {}
 
+# In-memory ring buffer of recent webhook events for the dashboard.
+# Cloud Run scales to zero so this resets on cold start — fine for a "last hour" view.
+_EVENTS_LOCK = threading.Lock()
+_EVENTS: collections.deque = collections.deque(maxlen=200)
+_BOOT_TS = time.time()
+
+
+def _record_event(event: dict) -> None:
+    with _EVENTS_LOCK:
+        _EVENTS.appendleft(event)
+
 
 @app.route("/debug", methods=["GET"])
 def debug():
@@ -326,38 +339,212 @@ def debug_cert():
 @app.route("/webhook", methods=["POST"])
 def webhook():
     global _last_payload
+    t_start = time.time()
     payload = request.get_json(silent=True) or {}
     _last_payload = payload
     log.info(f"Webhook received: {json.dumps(payload)}")
 
     camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu, location_uuid = parse_payload(payload)
 
-    if not camera_uuid:
-        return jsonify({"status": "ignored", "reason": "no camera uuid"}), 200
+    event = {
+        "received_at": t_start,
+        "camera_uuid": camera_uuid or "",
+        "event_uuid":  event_uuid or "",
+        "timestamp_ms": timestamp_ms,
+        "tu_present":  bool(seekpoint_tu),
+        "status":      "pending",
+        "forklift":    False,
+        "count":       0,
+        "best_conf":   0.0,
+        "detections":  0,
+        "latency_ms":  0,
+        "reason":      "",
+    }
 
-    log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
+    try:
+        if not camera_uuid:
+            event.update(status="ignored", reason="no camera uuid")
+            return jsonify({"status": "ignored", "reason": "no camera uuid"}), 200
 
-    thumb = get_frame(camera_uuid, timestamp_ms, event_uuid or "", region, seekpoint_tu)
+        log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
 
-    if not thumb or not thumb.exists():
-        log.warning("Could not obtain image.")
-        return jsonify({"status": "error", "reason": "image unavailable"}), 200
+        thumb = get_frame(camera_uuid, timestamp_ms, event_uuid or "", region, seekpoint_tu)
 
-    detections = run_detection(thumb)
-    forklifts  = [d for d in detections if d[0] == "forklift"]
+        if not thumb or not thumb.exists():
+            log.warning("Could not obtain image.")
+            event.update(status="error", reason="image unavailable")
+            return jsonify({"status": "error", "reason": "image unavailable"}), 200
 
-    if not forklifts:
-        log.info("No forklift detected.")
-        return jsonify({"status": "ok", "forklift": False}), 200
+        detections = run_detection(thumb)
+        forklifts  = [d for d in detections if d[0] == "forklift"]
+        event["detections"] = len(detections)
 
-    best_conf = max(f[1] for f in forklifts)
-    log.info(f"Forklift detected! {len(forklifts)} instance(s), best conf {best_conf:.1%}. Creating annotations...")
-    log_detection(camera_uuid, event_uuid or "", forklifts)
-    sp_resp = create_seekpoint(camera_uuid, timestamp_ms, best_conf, location_uuid)
-    bb_resp = create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
-    log.info(f"Seekpoint write: {sp_resp}  |  Bbox write: {bb_resp}")
+        if not forklifts:
+            log.info("No forklift detected.")
+            event.update(status="ok", forklift=False)
+            return jsonify({"status": "ok", "forklift": False}), 200
 
-    return jsonify({"status": "ok", "forklift": True, "count": len(forklifts)}), 200
+        best_conf = max(f[1] for f in forklifts)
+        log.info(f"Forklift detected! {len(forklifts)} instance(s), best conf {best_conf:.1%}. Creating annotations...")
+        log_detection(camera_uuid, event_uuid or "", forklifts)
+        sp_resp = create_seekpoint(camera_uuid, timestamp_ms, best_conf, location_uuid)
+        bb_resp = create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
+        log.info(f"Seekpoint write: {sp_resp}  |  Bbox write: {bb_resp}")
+
+        event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf)
+        return jsonify({"status": "ok", "forklift": True, "count": len(forklifts)}), 200
+    finally:
+        event["latency_ms"] = int((time.time() - t_start) * 1000)
+        _record_event(event)
+
+
+@app.route("/stats.json", methods=["GET"])
+def stats():
+    with _EVENTS_LOCK:
+        events = list(_EVENTS)
+    total      = len(events)
+    forklift_n = sum(1 for e in events if e.get("forklift"))
+    errors_n   = sum(1 for e in events if e.get("status") == "error")
+    ignored_n  = sum(1 for e in events if e.get("status") == "ignored")
+    latencies  = [e["latency_ms"] for e in events if e.get("latency_ms")]
+    avg_latency = int(sum(latencies) / len(latencies)) if latencies else 0
+    per_camera: dict = {}
+    for e in events:
+        cam = e.get("camera_uuid") or "unknown"
+        slot = per_camera.setdefault(cam, {"total": 0, "forklift": 0})
+        slot["total"] += 1
+        if e.get("forklift"):
+            slot["forklift"] += 1
+    return jsonify({
+        "uptime_sec":   int(time.time() - _BOOT_TS),
+        "total":        total,
+        "forklifts":    forklift_n,
+        "errors":       errors_n,
+        "ignored":      ignored_n,
+        "avg_latency":  avg_latency,
+        "hit_rate":     (forklift_n / total) if total else 0,
+        "per_camera":   per_camera,
+        "events":       events[:50],
+        "now":          time.time(),
+    }), 200
+
+
+DASHBOARD_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Forklift Detection — Live Dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.4 -apple-system, system-ui, sans-serif; margin: 0; background: #0c0e13; color: #e6e8eb; }
+  header { padding: 16px 24px; background: #14181f; border-bottom: 1px solid #222833; display: flex; justify-content: space-between; align-items: center; }
+  h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  .pulse { display:inline-block; width: 8px; height: 8px; background: #2ecc71; border-radius: 50%; margin-right: 8px; animation: pulse 1.6s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: .3 } }
+  main { padding: 24px; max-width: 1200px; margin: 0 auto; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 24px; }
+  .card { background: #14181f; border: 1px solid #222833; border-radius: 8px; padding: 14px 16px; }
+  .card .label { color: #8b97a8; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .card .value { font-size: 24px; font-weight: 600; margin-top: 4px; }
+  .card .value.green { color: #2ecc71; }
+  .card .value.red { color: #e74c3c; }
+  .card .value.amber { color: #f1c40f; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .05em; color: #8b97a8; margin: 24px 0 8px; }
+  table { width: 100%; border-collapse: collapse; background: #14181f; border: 1px solid #222833; border-radius: 8px; overflow: hidden; }
+  th, td { text-align: left; padding: 10px 12px; border-bottom: 1px solid #222833; font-variant-numeric: tabular-nums; }
+  th { background: #1a1f29; color: #8b97a8; font-weight: 500; font-size: 11px; text-transform: uppercase; }
+  tr:last-child td { border-bottom: none; }
+  tr.forklift { background: rgba(46, 204, 113, .08); }
+  tr.error { background: rgba(231, 76, 60, .08); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 500; }
+  .badge.ok { background: #1a3a2a; color: #2ecc71; }
+  .badge.error { background: #3a1a1a; color: #e74c3c; }
+  .badge.ignored { background: #2a2f3a; color: #8b97a8; }
+  .badge.forklift { background: #1a3a2a; color: #2ecc71; }
+  .muted { color: #6b7585; font-size: 11px; }
+  .foot { margin-top: 20px; text-align: center; color: #6b7585; font-size: 11px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Forklift Detection — Live Pipeline</h1>
+  <div><span class="pulse"></span><span id="status">connecting…</span></div>
+</header>
+<main>
+  <div class="cards">
+    <div class="card"><div class="label">Events (last 200)</div><div class="value" id="total">—</div></div>
+    <div class="card"><div class="label">Forklifts Detected</div><div class="value green" id="forklifts">—</div></div>
+    <div class="card"><div class="label">Hit Rate</div><div class="value" id="hit_rate">—</div></div>
+    <div class="card"><div class="label">Errors</div><div class="value red" id="errors">—</div></div>
+    <div class="card"><div class="label">Avg Latency</div><div class="value" id="avg_latency">—</div></div>
+    <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">—</div></div>
+  </div>
+
+  <h2>Per Camera</h2>
+  <table><thead><tr><th>Camera UUID</th><th>Events</th><th>Forklifts</th><th>Hit Rate</th></tr></thead>
+    <tbody id="per_camera"><tr><td colspan="4" class="muted">no data yet</td></tr></tbody>
+  </table>
+
+  <h2>Recent Events</h2>
+  <table><thead><tr>
+    <th>Time</th><th>Camera</th><th>Event</th><th>Status</th><th>Forklift</th><th>Conf</th><th>Dets</th><th>Latency</th><th>Reason</th>
+  </tr></thead>
+    <tbody id="events"><tr><td colspan="9" class="muted">waiting for webhook activity…</td></tr></tbody>
+  </table>
+
+  <div class="foot">Polls <code>/stats.json</code> every 2 s · In-memory buffer, resets on cold start</div>
+</main>
+<script>
+function fmtTime(t) {
+  const d = new Date(t * 1000);
+  return d.toLocaleTimeString([], {hour12:false});
+}
+function fmtUptime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60);
+  return h ? `${h}h ${m}m` : `${m}m ${s%60}s`;
+}
+function shortId(id) { return id ? id.slice(0, 8) + '…' : '—'; }
+async function tick() {
+  try {
+    const r = await fetch('/stats.json', {cache:'no-store'});
+    const d = await r.json();
+    document.getElementById('status').textContent = 'live';
+    document.getElementById('total').textContent = d.total;
+    document.getElementById('forklifts').textContent = d.forklifts;
+    document.getElementById('hit_rate').textContent = (d.hit_rate*100).toFixed(1) + '%';
+    document.getElementById('errors').textContent = d.errors;
+    document.getElementById('avg_latency').textContent = d.avg_latency + ' ms';
+    document.getElementById('uptime').textContent = fmtUptime(d.uptime_sec);
+
+    const pcBody = document.getElementById('per_camera');
+    const cams = Object.entries(d.per_camera);
+    pcBody.innerHTML = cams.length
+      ? cams.map(([uuid,s]) => `<tr><td><code>${shortId(uuid)}</code></td><td>${s.total}</td><td>${s.forklift}</td><td>${s.total?((s.forklift/s.total*100).toFixed(0)+'%'):'—'}</td></tr>`).join('')
+      : '<tr><td colspan="4" class="muted">no data yet</td></tr>';
+
+    const evBody = document.getElementById('events');
+    evBody.innerHTML = d.events.length
+      ? d.events.map(e => {
+          const statusBadge = `<span class="badge ${e.status}">${e.status}</span>`;
+          const forkBadge = e.forklift ? `<span class="badge forklift">YES ×${e.count}</span>` : '—';
+          const conf = e.best_conf ? (e.best_conf*100).toFixed(1)+'%' : '—';
+          const rowCls = e.forklift ? 'forklift' : (e.status === 'error' ? 'error' : '');
+          return `<tr class="${rowCls}"><td>${fmtTime(e.received_at)}</td><td><code>${shortId(e.camera_uuid)}</code></td><td><code>${shortId(e.event_uuid)}</code></td><td>${statusBadge}</td><td>${forkBadge}</td><td>${conf}</td><td>${e.detections}</td><td>${e.latency_ms} ms</td><td class="muted">${e.reason||''}</td></tr>`;
+        }).join('')
+      : '<tr><td colspan="9" class="muted">waiting for webhook activity…</td></tr>';
+  } catch (e) {
+    document.getElementById('status').textContent = 'reconnecting…';
+  }
+}
+tick(); setInterval(tick, 2000);
+</script>
+</body></html>"""
+
+
+@app.route("/dashboard", methods=["GET"])
+def dashboard():
+    from flask import Response
+    return Response(DASHBOARD_HTML, mimetype="text/html")
 
 
 @app.route("/health", methods=["GET"])
