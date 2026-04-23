@@ -86,7 +86,10 @@ def download_media(url: str) -> Path | None:
         full_url = url if url.startswith("http") else f"{MEDIA_API}{url}"
         resp = requests.get(
             full_url,
-            headers={"X-Auth-Apikey": RHOMBUS_API_KEY},
+            headers={
+                "X-Auth-Apikey": RHOMBUS_API_KEY,
+                "X-Auth-Scheme": "api",
+            },
             cert=_cert(),
             verify=False,
             timeout=15,
