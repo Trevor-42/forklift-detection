@@ -184,14 +184,19 @@ def run_detection(image_path: Path):
     return detections
 
 
-def create_seekpoint(camera_uuid: str, timestamp_ms: int):
+def create_seekpoint(camera_uuid: str, timestamp_ms: int, confidence: float = 0.0,
+                     location_uuid: str = ""):
+    sp = {
+        "timestampMs": timestamp_ms,
+        "name":        "Forklift Detection",
+        "description": f"YOLO forklift detection — {confidence:.1%} confidence",
+        "color":       "GREEN",
+    }
+    if location_uuid:
+        sp["locationUuid"] = location_uuid
     return rhombus_post("camera/createCustomFootageSeekpoints", {
         "cameraUuid": camera_uuid,
-        "footageSeekPoints": [{
-            "timestampMs": timestamp_ms,
-            "name": "Forklift Movement",
-            "color": "GREEN",
-        }]
+        "footageSeekPoints": [sp],
     })
 
 
@@ -228,17 +233,18 @@ def log_detection(camera_uuid: str, alert_uuid: str, detections: list):
 
 
 def parse_payload(payload: dict):
-    """Extract (camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu) from any Rhombus webhook format."""
+    """Extract (camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu, location_uuid) from any Rhombus webhook format."""
     # Rules Engine deviceEvents format
     if "deviceEvents" in payload:
         events = payload["deviceEvents"]
         if not events:
-            return None, None, int(time.time() * 1000), "us-east-2", ""
+            return None, None, int(time.time() * 1000), "us-east-2", "", ""
         event = events[0]
-        camera_uuid  = event.get("deviceUuid", "").split(".")[0]  # strip .v0 suffix if present
-        event_uuid   = event.get("eventUuid") or event.get("uuid")
-        timestamp_ms = event.get("timestampMs", payload.get("triggeredTimestampMs", int(time.time() * 1000)))
-        region       = event.get("thumbnailLocation", {}).get("region", "us-east-2")
+        camera_uuid   = event.get("deviceUuid", "").split(".")[0]  # strip .v0 suffix if present
+        event_uuid    = event.get("eventUuid") or event.get("uuid")
+        timestamp_ms  = event.get("timestampMs", payload.get("triggeredTimestampMs", int(time.time() * 1000)))
+        region        = event.get("thumbnailLocation", {}).get("region", "us-east-2")
+        location_uuid = event.get("locationUuid", "")
         # Pick the best seekpoint thumbnail — prefer MOTION_CAR frames
         seekpoint_tu = ""
         for sp in event.get("seekpoints", []):
@@ -250,7 +256,7 @@ def parse_payload(payload: dict):
                 if sp.get("tu"):
                     seekpoint_tu = sp["tu"]
                     break
-        return camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu
+        return camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu, location_uuid
 
     # Legacy triggerEvent format
     if "triggerEvent" in payload:
@@ -258,13 +264,13 @@ def parse_payload(payload: dict):
         camera_uuid  = event.get("deviceUuid") or event.get("cameraUuid")
         event_uuid   = event.get("uuid") or event.get("eventUuid") or payload.get("ruleUuid")
         timestamp_ms = event.get("timestampMs", int(time.time() * 1000))
-        return camera_uuid, event_uuid, timestamp_ms, "us-east-2", ""
+        return camera_uuid, event_uuid, timestamp_ms, "us-east-2", "", event.get("locationUuid", "")
 
     # Policy alert payload
     camera_uuid  = payload.get("deviceUuid") or payload.get("cameraUuid")
     event_uuid   = payload.get("policyAlertUuid") or payload.get("uuid")
     timestamp_ms = payload.get("timestampMs", int(time.time() * 1000))
-    return camera_uuid, event_uuid, timestamp_ms, "us-east-2", ""
+    return camera_uuid, event_uuid, timestamp_ms, "us-east-2", "", payload.get("locationUuid", "")
 
 
 _last_payload: dict = {}
@@ -323,7 +329,7 @@ def webhook():
     _last_payload = payload
     log.info(f"Webhook received: {json.dumps(payload)}")
 
-    camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu = parse_payload(payload)
+    camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu, location_uuid = parse_payload(payload)
 
     if not camera_uuid:
         return jsonify({"status": "ignored", "reason": "no camera uuid"}), 200
@@ -343,10 +349,12 @@ def webhook():
         log.info("No forklift detected.")
         return jsonify({"status": "ok", "forklift": False}), 200
 
-    log.info(f"Forklift detected! {len(forklifts)} instance(s). Creating annotations...")
+    best_conf = max(f[1] for f in forklifts)
+    log.info(f"Forklift detected! {len(forklifts)} instance(s), best conf {best_conf:.1%}. Creating annotations...")
     log_detection(camera_uuid, event_uuid or "", forklifts)
-    create_seekpoint(camera_uuid, timestamp_ms)
-    create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
+    sp_resp = create_seekpoint(camera_uuid, timestamp_ms, best_conf, location_uuid)
+    bb_resp = create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
+    log.info(f"Seekpoint write: {sp_resp}  |  Bbox write: {bb_resp}")
 
     return jsonify({"status": "ok", "forklift": True, "count": len(forklifts)}), 200
 
