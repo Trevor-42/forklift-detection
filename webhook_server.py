@@ -366,13 +366,21 @@ def webhook():
             event.update(status="ignored", reason="no camera uuid")
             return jsonify({"status": "ignored", "reason": "no camera uuid"}), 200
 
+        # Rules Engine fires twice per event: a minimal "first ping" (no eventUuid,
+        # no seekpoints, no tu URLs) then a finalized payload ~5-30s later with all
+        # the media handles we need. Skip the minimal one — it has nothing fetchable.
+        if not event_uuid and not seekpoint_tu:
+            log.info(f"Minimal payload on {camera_uuid} — deferring, awaiting finalized event")
+            event.update(status="deferred", reason="awaiting finalized event")
+            return jsonify({"status": "deferred", "reason": "awaiting finalized event"}), 200
+
         log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
 
         thumb = get_frame(camera_uuid, timestamp_ms, event_uuid or "", region, seekpoint_tu)
 
         if not thumb or not thumb.exists():
             log.warning("Could not obtain image.")
-            event.update(status="error", reason="image unavailable")
+            event.update(status="error", reason="media URL expired or not yet available")
             return jsonify({"status": "error", "reason": "image unavailable"}), 200
 
         detections = run_detection(thumb)
@@ -406,6 +414,7 @@ def stats():
     forklift_n = sum(1 for e in events if e.get("forklift"))
     errors_n   = sum(1 for e in events if e.get("status") == "error")
     ignored_n  = sum(1 for e in events if e.get("status") == "ignored")
+    deferred_n = sum(1 for e in events if e.get("status") == "deferred")
     latencies  = [e["latency_ms"] for e in events if e.get("latency_ms")]
     avg_latency = int(sum(latencies) / len(latencies)) if latencies else 0
     per_camera: dict = {}
@@ -421,6 +430,7 @@ def stats():
         "forklifts":    forklift_n,
         "errors":       errors_n,
         "ignored":      ignored_n,
+        "deferred":     deferred_n,
         "avg_latency":  avg_latency,
         "hit_rate":     (forklift_n / total) if total else 0,
         "per_camera":   per_camera,
@@ -460,6 +470,8 @@ DASHBOARD_HTML = """<!doctype html>
   .badge.ok { background: #1a3a2a; color: #2ecc71; }
   .badge.error { background: #3a1a1a; color: #e74c3c; }
   .badge.ignored { background: #2a2f3a; color: #8b97a8; }
+  .badge.deferred { background: #2a2a3a; color: #a29bfe; }
+  .badge.pending { background: #2a2f3a; color: #8b97a8; }
   .badge.forklift { background: #1a3a2a; color: #2ecc71; }
   .muted { color: #6b7585; font-size: 11px; }
   .foot { margin-top: 20px; text-align: center; color: #6b7585; font-size: 11px; }
@@ -476,6 +488,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="label">Forklifts Detected</div><div class="value green" id="forklifts">—</div></div>
     <div class="card"><div class="label">Hit Rate</div><div class="value" id="hit_rate">—</div></div>
     <div class="card"><div class="label">Errors</div><div class="value red" id="errors">—</div></div>
+    <div class="card"><div class="label">Deferred (awaiting finalized)</div><div class="value" id="deferred">—</div></div>
     <div class="card"><div class="label">Avg Latency</div><div class="value" id="avg_latency">—</div></div>
     <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">—</div></div>
   </div>
@@ -513,6 +526,7 @@ async function tick() {
     document.getElementById('forklifts').textContent = d.forklifts;
     document.getElementById('hit_rate').textContent = (d.hit_rate*100).toFixed(1) + '%';
     document.getElementById('errors').textContent = d.errors;
+    document.getElementById('deferred').textContent = d.deferred;
     document.getElementById('avg_latency').textContent = d.avg_latency + ' ms';
     document.getElementById('uptime').textContent = fmtUptime(d.uptime_sec);
 
