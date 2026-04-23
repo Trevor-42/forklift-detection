@@ -180,31 +180,59 @@ def refresh_tu_url(camera_uuid: str, timestamp_ms: int, window_sec: int = 10) ->
         return ""
 
 
+def get_exact_frame_uri(camera_uuid: str, timestamp_ms: int) -> str:
+    """Ask Rhombus for a URI to the exact recorded frame at timestamp_ms.
+
+    Unlike thumbnail `tu` URLs (ephemeral in-memory cache), this reads from
+    recorded footage on disk, so it works even when the webhook lands long
+    after the event.
+    """
+    try:
+        resp = rhombus_post("video/getExactFrameUri", {
+            "cameraUuid":  f"{camera_uuid}.v0",
+            "timestampMs": timestamp_ms,
+        })
+        if isinstance(resp, dict) and not resp.get("error") and resp.get("frameUri"):
+            return resp["frameUri"]
+        log.info(f"getExactFrameUri: {resp.get('responseMessage') if isinstance(resp, dict) else resp}")
+    except Exception as e:
+        log.warning(f"getExactFrameUri failed: {e}")
+    return ""
+
+
 def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
               region: str = "us-east-2", seekpoint_tu: str = "") -> Path | None:
     """Get a frame for YOLO — tries multiple strategies in decreasing freshness."""
-    # Strategy 1: rhombus CLI (works for alert UUIDs; usually fails for raw event UUIDs)
-    frame = download_via_cli(event_uuid)
-    if frame:
-        return frame
-
-    # Strategy 2: the tu URL the webhook delivered — fastest path when fresh
+    # Strategy 1: webhook-delivered tu URL — fastest path when fresh (no extra API call)
     if seekpoint_tu:
         frame = download_media(seekpoint_tu)
         if frame:
             return frame
-        log.info("Webhook tu URL expired — requerying seekpoints for a fresh token")
+        log.info("Webhook tu URL expired — falling back to getExactFrameUri")
 
-    # Strategy 3: re-query seekpoints to mint a freshly-signed tu URL.
-    # This is the common case when the webhook lands >10s after the event.
+    # Strategy 2: getExactFrameUri — pulls exact frame from recorded footage.
+    # Robust against thumbnail-cache eviction; works for any ts in retention.
+    exact_uri = get_exact_frame_uri(camera_uuid, timestamp_ms)
+    if exact_uri:
+        frame = download_media(exact_uri)
+        if frame:
+            log.info("Fetched frame via getExactFrameUri")
+            return frame
+
+    # Strategy 3: rhombus CLI (works only for promoted alert UUIDs)
+    frame = download_via_cli(event_uuid)
+    if frame:
+        return frame
+
+    # Strategy 4: re-query seekpoints for a freshly-signed tu URL
     fresh_tu = refresh_tu_url(camera_uuid, timestamp_ms)
-    if fresh_tu:
+    if fresh_tu and fresh_tu != seekpoint_tu:
         frame = download_media(fresh_tu)
         if frame:
             log.info("Recovered frame via refreshed tu URL")
             return frame
 
-    # Strategy 4: metadata URL (only works if event has been promoted to an alert)
+    # Strategy 5: metadata URL (only if event promoted to an alert)
     if event_uuid:
         frame = download_media(f"{MEDIA_API}/media/metadata/{region}/{event_uuid}.jpeg")
         if frame:
