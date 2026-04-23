@@ -193,17 +193,18 @@ def create_seekpoint(camera_uuid: str, timestamp_ms: int):
 
 
 def create_bounding_boxes(camera_uuid: str, timestamp_ms: int, detections: list):
+    # API uses short key names: ts, a, l, t, r, b, c, objectId, m
     boxes = [
         {
-            "timestampMs": timestamp_ms,
-            "activity":    "MOTION_CAR",
-            "left":        int(x0 / img_w * 10000),
-            "top":         int(y0 / img_h * 10000),
-            "right":       int(x1 / img_w * 10000),
-            "bottom":      int(y1 / img_h * 10000),
-            "confidence":  round(conf, 4),
-            "objectId":    i + 1,
-            "inMotion":    True,
+            "ts":       timestamp_ms,
+            "a":        "MOTION_CAR",
+            "l":        int(x0 / img_w * 10000),
+            "t":        int(y0 / img_h * 10000),
+            "r":        int(x1 / img_w * 10000),
+            "b":        int(y1 / img_h * 10000),
+            "c":        round(conf, 4),
+            "objectId": i + 1,
+            "m":        True,
         }
         for i, (_, conf, x0, y0, x1, y1, img_w, img_h) in enumerate(detections)
     ]
