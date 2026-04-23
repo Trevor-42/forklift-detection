@@ -124,7 +124,7 @@ def create_seekpoint(camera_uuid: str, timestamp_ms: int, profile: str):
         "footageSeekPoints": [{
             "timestampMs": timestamp_ms,
             "name": "Forklift Movement",
-            "color": "BLUE"
+            "color": "GREEN"
         }]
     }
     result = subprocess.run(
