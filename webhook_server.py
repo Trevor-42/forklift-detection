@@ -151,20 +151,60 @@ def download_via_cli(event_uuid: str) -> Path | None:
     return None
 
 
+def refresh_tu_url(camera_uuid: str, timestamp_ms: int, window_sec: int = 10) -> str:
+    """Re-query getCameraFootageSeekpointsV2 for a freshly-signed tu URL near timestamp_ms.
+
+    The tu URLs returned directly in the webhook carry a short-lived auth token
+    (?a=...) that expires within seconds. Calling this endpoint mints a new one
+    that's valid at the time of the call.
+    """
+    try:
+        start_sec = max(0, (timestamp_ms // 1000) - window_sec)
+        resp = rhombus_post("camera/getFootageSeekpointsV2", {
+            "cameraUuid":       f"{camera_uuid}.v0",
+            "startTime":        start_sec,
+            "duration":         window_sec * 2,
+            "includeAnyMotion": False,
+        })
+        sps = resp.get("footageSeekPoints", []) if isinstance(resp, dict) else []
+        # Pick the MOTION_CAR seekpoint closest to our target timestamp with a tu URL
+        candidates = [sp for sp in sps if sp.get("tu") and sp.get("a") == "MOTION_CAR"]
+        if not candidates:
+            candidates = [sp for sp in sps if sp.get("tu")]
+        if not candidates:
+            return ""
+        best = min(candidates, key=lambda sp: abs(sp.get("ts", 0) - timestamp_ms))
+        return best.get("tu", "")
+    except Exception as e:
+        log.warning(f"refresh_tu_url failed: {e}")
+        return ""
+
+
 def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
               region: str = "us-east-2", seekpoint_tu: str = "") -> Path | None:
-    """Get a frame for YOLO — tries CLI auth first, then direct media download."""
-    # Primary: rhombus CLI handles all Rhombus auth natively
+    """Get a frame for YOLO — tries multiple strategies in decreasing freshness."""
+    # Strategy 1: rhombus CLI (works for alert UUIDs; usually fails for raw event UUIDs)
     frame = download_via_cli(event_uuid)
     if frame:
         return frame
 
-    # Fallback: direct media download with cert
+    # Strategy 2: the tu URL the webhook delivered — fastest path when fresh
     if seekpoint_tu:
         frame = download_media(seekpoint_tu)
         if frame:
             return frame
+        log.info("Webhook tu URL expired — requerying seekpoints for a fresh token")
 
+    # Strategy 3: re-query seekpoints to mint a freshly-signed tu URL.
+    # This is the common case when the webhook lands >10s after the event.
+    fresh_tu = refresh_tu_url(camera_uuid, timestamp_ms)
+    if fresh_tu:
+        frame = download_media(fresh_tu)
+        if frame:
+            log.info("Recovered frame via refreshed tu URL")
+            return frame
+
+    # Strategy 4: metadata URL (only works if event has been promoted to an alert)
     if event_uuid:
         frame = download_media(f"{MEDIA_API}/media/metadata/{region}/{event_uuid}.jpeg")
         if frame:
