@@ -15,6 +15,7 @@ Environment variables required:
 """
 from __future__ import annotations
 
+import base64
 import collections
 import concurrent.futures
 import csv
@@ -26,6 +27,7 @@ import tempfile
 import threading
 import time
 from datetime import datetime
+from io import BytesIO
 from pathlib import Path
 
 import requests
@@ -67,6 +69,21 @@ def get_model():
         model = YOLO(str(WEIGHTS))
         log.info("YOLO model loaded.")
     return model
+
+
+def _thumbnail_b64(path: Path, max_width: int = 320) -> str:
+    """Resize image to max_width and return base64-encoded JPEG for dashboard embedding."""
+    try:
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+        if w > max_width:
+            img = img.resize((max_width, int(h * max_width / w)), Image.LANCZOS)
+        buf = BytesIO()
+        img.save(buf, format="JPEG", quality=75)
+        return base64.b64encode(buf.getvalue()).decode()
+    except Exception as e:
+        log.warning(f"Thumbnail generation failed: {e}")
+        return ""
 
 
 def rhombus_post(endpoint: str, payload: dict):
@@ -505,6 +522,7 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
         "detections":   0,
         "latency_ms":   0,
         "reason":       "deferred fallback",
+        "thumb_b64":    "",
     }
     try:
         # After 45s the pre-fetch future (started at first-ping time) is almost certainly done.
@@ -526,16 +544,22 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
         forklifts: list = []
         det_timestamp_ms = timestamp_ms
         total_detections = 0
+        thumb_frame: Path | None = None
         for frame_path, frame_ts in frames:
+            if thumb_frame is None:
+                thumb_frame = frame_path
             dets = run_detection(frame_path, crop_permyriad=None)
             total_detections += len(dets)
             hits = [d for d in dets if d[0] == "forklift"]
             if hits:
                 forklifts = hits
                 det_timestamp_ms = frame_ts
+                thumb_frame = frame_path
                 log.info(f"Sweeper: forklift at frame ts={frame_ts} ({frames.index((frame_path, frame_ts)) + 1}/{len(frames)})")
                 break
         event["detections"] = total_detections
+        if thumb_frame:
+            event["thumb_b64"] = _thumbnail_b64(thumb_frame)
         if not forklifts:
             log.info(f"Sweeper: no forklift on deferred event for {camera_uuid}")
             event.update(status="ok", forklift=False)
@@ -640,6 +664,7 @@ def webhook():
         "detections":  0,
         "latency_ms":  0,
         "reason":      "",
+        "thumb_b64":   "",
     }
 
     try:
@@ -719,8 +744,11 @@ def webhook():
         forklifts: list = []
         det_timestamp_ms = timestamp_ms
         total_detections = 0
+        thumb_frame: Path | None = None
 
         for frame_path, frame_ts, pre_cropped in frames_to_scan:
+            if thumb_frame is None:
+                thumb_frame = frame_path
             hint = None if pre_cropped else crop_hint
             dets = run_detection(frame_path, crop_permyriad=hint)
             total_detections += len(dets)
@@ -728,10 +756,13 @@ def webhook():
             if hits:
                 forklifts = hits
                 det_timestamp_ms = frame_ts
+                thumb_frame = frame_path
                 log.info(f"Forklift found at frame ts={frame_ts} ({frames_to_scan.index((frame_path, frame_ts, pre_cropped)) + 1}/{len(frames_to_scan)})")
                 break
 
         event["detections"] = total_detections
+        if thumb_frame:
+            event["thumb_b64"] = _thumbnail_b64(thumb_frame)
 
         if not forklifts:
             log.info("No forklift detected.")
@@ -821,6 +852,11 @@ DASHBOARD_HTML = """<!doctype html>
   .badge.forklift { background: #1a3a2a; color: #2ecc71; }
   .muted { color: #6b7585; font-size: 11px; }
   .foot { margin-top: 20px; text-align: center; color: #6b7585; font-size: 11px; }
+  .thumb { height: 54px; border-radius: 4px; cursor: pointer; display: block; border: 1px solid #222833; }
+  .thumb:hover { border-color: #a29bfe; }
+  #modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.85); z-index:999; align-items:center; justify-content:center; }
+  #modal img { max-width:90vw; max-height:90vh; border-radius:8px; border:1px solid #333; }
+  #modal-close { position:absolute; top:20px; right:28px; font-size:28px; color:#fff; cursor:pointer; line-height:1; }
 </style>
 </head>
 <body>
@@ -846,10 +882,15 @@ DASHBOARD_HTML = """<!doctype html>
 
   <h2>Recent Events</h2>
   <table><thead><tr>
-    <th>Time</th><th>Camera</th><th>Event</th><th>Status</th><th>Forklift</th><th>Conf</th><th>Dets</th><th>Latency</th><th>Reason</th>
+    <th>Time</th><th>Camera</th><th>Event</th><th>Status</th><th>Forklift</th><th>Conf</th><th>Dets</th><th>Latency</th><th>Reason</th><th>Frame</th>
   </tr></thead>
-    <tbody id="events"><tr><td colspan="9" class="muted">waiting for webhook activity…</td></tr></tbody>
+    <tbody id="events"><tr><td colspan="10" class="muted">waiting for webhook activity…</td></tr></tbody>
   </table>
+
+  <div id="modal" onclick="closeModal()">
+    <span id="modal-close" onclick="closeModal()">×</span>
+    <img id="modal-img" src="" alt="frame" onclick="event.stopPropagation()" />
+  </div>
 
   <div class="foot">Polls <code>/stats.json</code> every 2 s · In-memory buffer, resets on cold start</div>
 </main>
@@ -863,6 +904,14 @@ function fmtUptime(s) {
   return h ? `${h}h ${m}m` : `${m}m ${s%60}s`;
 }
 function shortId(id) { return id ? id.slice(0, 8) + '…' : '—'; }
+function showFrame(src) {
+  document.getElementById('modal-img').src = src;
+  document.getElementById('modal').style.display = 'flex';
+}
+function closeModal() {
+  document.getElementById('modal').style.display = 'none';
+}
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 async function tick() {
   try {
     const r = await fetch('/stats.json', {cache:'no-store'});
@@ -889,9 +938,11 @@ async function tick() {
           const forkBadge = e.forklift ? `<span class="badge forklift">YES ×${e.count}</span>` : '—';
           const conf = e.best_conf ? (e.best_conf*100).toFixed(1)+'%' : '—';
           const rowCls = e.forklift ? 'forklift' : (e.status === 'error' ? 'error' : '');
-          return `<tr class="${rowCls}"><td>${fmtTime(e.received_at)}</td><td><code>${shortId(e.camera_uuid)}</code></td><td><code>${shortId(e.event_uuid)}</code></td><td>${statusBadge}</td><td>${forkBadge}</td><td>${conf}</td><td>${e.detections}</td><td>${e.latency_ms} ms</td><td class="muted">${e.reason||''}</td></tr>`;
+          const src = `data:image/jpeg;base64,${e.thumb_b64}`;
+          const thumbCell = e.thumb_b64 ? `<td><img class="thumb" src="${src}" onclick="showFrame('${src}')" /></td>` : `<td class="muted">—</td>`;
+          return `<tr class="${rowCls}"><td>${fmtTime(e.received_at)}</td><td><code>${shortId(e.camera_uuid)}</code></td><td><code>${shortId(e.event_uuid)}</code></td><td>${statusBadge}</td><td>${forkBadge}</td><td>${conf}</td><td>${e.detections}</td><td>${e.latency_ms} ms</td><td class="muted">${e.reason||''}</td>${thumbCell}</tr>`;
         }).join('')
-      : '<tr><td colspan="9" class="muted">waiting for webhook activity…</td></tr>';
+      : '<tr><td colspan="10" class="muted">waiting for webhook activity…</td></tr>';
   } catch (e) {
     document.getElementById('status').textContent = 'reconnecting…';
   }
