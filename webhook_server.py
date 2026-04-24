@@ -16,6 +16,7 @@ Environment variables required:
 from __future__ import annotations
 
 import collections
+import concurrent.futures
 import csv
 import json
 import logging
@@ -474,8 +475,11 @@ _BOOT_TS = time.time()
 
 # Minimal pings that never received a finalized followup.
 # Keyed by camera_uuid; swept every 10s and processed after a 45s timeout.
+# Each entry also carries a frames_future — analyze_event_frames running in background
+# so frames are ready (or nearly ready) when the finalized second ping arrives.
 _PENDING_LOCK = threading.Lock()
-_PENDING: dict = {}  # camera_uuid -> {timestamp_ms, location_uuid, deferred_at}
+_PENDING: dict = {}  # camera_uuid -> {timestamp_ms, location_uuid, deferred_at, frames_future}
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="prefetch")
 
 
 def _record_event(event: dict) -> None:
@@ -483,7 +487,8 @@ def _record_event(event: dict) -> None:
         _EVENTS.appendleft(event)
 
 
-def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str) -> None:
+def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
+                      frames_future=None) -> None:
     """Process a minimal-ping event whose finalized followup never arrived."""
     log.info(f"Sweeper: processing deferred event on {camera_uuid} at {timestamp_ms}")
     t_start = time.time()
@@ -502,8 +507,17 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str) -
         "reason":       "deferred fallback",
     }
     try:
-        # No durationSec in the minimal ping — use 20s default (~10 frames at 2s intervals).
-        frames = analyze_event_frames(camera_uuid, timestamp_ms, 20_000)
+        # After 45s the pre-fetch future (started at first-ping time) is almost certainly done.
+        frames = None
+        if frames_future is not None:
+            try:
+                frames = frames_future.result(timeout=5)
+                if frames:
+                    log.info(f"Sweeper: using {len(frames)} pre-fetched frames")
+            except Exception as e:
+                log.warning(f"Sweeper: pre-fetch future error: {e}")
+        if not frames:
+            frames = analyze_event_frames(camera_uuid, timestamp_ms, 20_000)
         if not frames:
             log.warning(f"Sweeper: no frames for deferred event on {camera_uuid}")
             event.update(status="error", reason="deferred: frames unavailable")
@@ -551,7 +565,8 @@ def _pending_sweeper() -> None:
                 to_process.append((cam, _PENDING.pop(cam)))
         for cam, info in to_process:
             try:
-                _process_deferred(cam, info["timestamp_ms"], info["location_uuid"])
+                _process_deferred(cam, info["timestamp_ms"], info["location_uuid"],
+                                  frames_future=info.get("frames_future"))
             except Exception as e:
                 log.warning(f"Sweeper exception for {cam}: {e}")
 
@@ -634,22 +649,28 @@ def webhook():
 
         # Rules Engine fires twice per event: a minimal "first ping" (no eventUuid,
         # no seekpoints, no tu URLs) then a finalized payload ~5-30s later with all
-        # the media handles we need. Stash the minimal one in _PENDING; the sweeper
-        # will process it via rhombus analyze if no finalized followup arrives in 45s.
+        # the media handles we need. On the first ping, immediately kick off
+        # analyze_event_frames in a background thread so frames are ready (or nearly
+        # ready) when the finalized second ping arrives, cutting ~12s off latency.
         if not event_uuid and not seekpoint_tu:
-            log.info(f"Minimal payload on {camera_uuid} — deferring, awaiting finalized event")
+            log.info(f"Minimal payload on {camera_uuid} — deferring, pre-fetching frames in background")
+            future = _EXECUTOR.submit(analyze_event_frames, camera_uuid, timestamp_ms, 20_000)
             with _PENDING_LOCK:
                 _PENDING[camera_uuid] = {
                     "timestamp_ms": timestamp_ms,
                     "location_uuid": location_uuid,
                     "deferred_at": time.time(),
+                    "frames_future": future,
                 }
             event.update(status="deferred", reason="awaiting finalized event")
             return jsonify({"status": "deferred", "reason": "awaiting finalized event"}), 200
 
-        # Finalized ping — cancel any pending sweeper entry for this camera.
+        # Finalized ping — pop any pending entry (grab the pre-fetch future if present).
+        frames_future = None
         with _PENDING_LOCK:
-            _PENDING.pop(camera_uuid, None)
+            pending_info = _PENDING.pop(camera_uuid, None)
+            if pending_info:
+                frames_future = pending_info.get("frames_future")
 
         log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
 
@@ -669,7 +690,24 @@ def webhook():
             else:
                 log.info("Webhook tu URL expired — scanning full event window")
 
-        event_frames = analyze_event_frames(camera_uuid, timestamp_ms, duration_sec * 1000)
+        # Use pre-fetched frames if the background thread already finished,
+        # otherwise wait for it (it started at first-ping time so it's often done).
+        # Fall back to a fresh narrow-window analyze if the future failed or wasn't set.
+        event_frames: list[tuple[Path, int]] = []
+        if frames_future is not None:
+            try:
+                event_frames = frames_future.result(timeout=50)
+                if event_frames:
+                    log.info(f"Used {len(event_frames)} pre-fetched frames from first-ping background fetch")
+                else:
+                    log.info("Pre-fetch returned no frames — running fresh analyze")
+            except Exception as e:
+                log.warning(f"Pre-fetch future failed: {e}")
+        if not event_frames:
+            # Narrow window first (faster CLI call); widen if no frames returned.
+            event_frames = analyze_event_frames(camera_uuid, timestamp_ms, 3_000)
+            if not event_frames:
+                event_frames = analyze_event_frames(camera_uuid, timestamp_ms, duration_sec * 1000)
         for p, fts in event_frames:
             frames_to_scan.append((p, fts, False))
 
