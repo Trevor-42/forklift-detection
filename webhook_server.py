@@ -875,7 +875,7 @@ def health():
 
 
 threading.Thread(target=_pending_sweeper, daemon=True, name="pending-sweeper").start()
+threading.Thread(target=get_model, daemon=True, name="model-preload").start()
 
 if __name__ == "__main__":
-    get_model()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
