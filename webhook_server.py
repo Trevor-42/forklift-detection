@@ -228,7 +228,7 @@ def analyze_event_frames(camera_uuid: str, timestamp_ms: int, duration_ms: int) 
              "--start", str(timestamp_ms),
              "--end",   str(timestamp_ms + duration_ms),
              "--fill", "--raw", "--output", tmpdir],
-            env=_cli_env(), capture_output=True, text=True, timeout=60,
+            env=_cli_env(), capture_output=True, text=True, timeout=90,
         )
         manifest_path = Path(tmpdir) / "manifest.json"
         if manifest_path.exists():
