@@ -436,10 +436,77 @@ _EVENTS_LOCK = threading.Lock()
 _EVENTS: collections.deque = collections.deque(maxlen=200)
 _BOOT_TS = time.time()
 
+# Minimal pings that never received a finalized followup.
+# Keyed by camera_uuid; swept every 10s and processed after a 45s timeout.
+_PENDING_LOCK = threading.Lock()
+_PENDING: dict = {}  # camera_uuid -> {timestamp_ms, location_uuid, deferred_at}
+
 
 def _record_event(event: dict) -> None:
     with _EVENTS_LOCK:
         _EVENTS.appendleft(event)
+
+
+def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str) -> None:
+    """Process a minimal-ping event whose finalized followup never arrived."""
+    log.info(f"Sweeper: processing deferred event on {camera_uuid} at {timestamp_ms}")
+    t_start = time.time()
+    event = {
+        "received_at":  t_start,
+        "camera_uuid":  camera_uuid,
+        "event_uuid":   "",
+        "timestamp_ms": timestamp_ms,
+        "tu_present":   False,
+        "status":       "pending",
+        "forklift":     False,
+        "count":        0,
+        "best_conf":    0.0,
+        "detections":   0,
+        "latency_ms":   0,
+        "reason":       "deferred fallback",
+    }
+    try:
+        frame = download_via_analyze(camera_uuid, timestamp_ms)
+        if not frame or not frame.exists():
+            log.warning(f"Sweeper: no frame for deferred event on {camera_uuid}")
+            event.update(status="error", reason="deferred: frame unavailable")
+            return
+        # No bbox hint — the minimal ping carries no boundingBoxes, so run on the full frame.
+        detections = run_detection(frame, crop_permyriad=None)
+        forklifts   = [d for d in detections if d[0] == "forklift"]
+        event["detections"] = len(detections)
+        if not forklifts:
+            log.info(f"Sweeper: no forklift on deferred event for {camera_uuid}")
+            event.update(status="ok", forklift=False)
+            return
+        best_conf = max(f[1] for f in forklifts)
+        log.info(f"Sweeper: forklift! {len(forklifts)} instance(s) at {best_conf:.1%} on {camera_uuid}")
+        log_detection(camera_uuid, "", forklifts)
+        sp_resp = create_seekpoint(camera_uuid, timestamp_ms, best_conf, location_uuid)
+        bb_resp = create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
+        log.info(f"Sweeper seekpoint: {sp_resp}  |  bbox: {bb_resp}")
+        event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf)
+    finally:
+        event["latency_ms"] = int((time.time() - t_start) * 1000)
+        _record_event(event)
+
+
+def _pending_sweeper() -> None:
+    """Background thread: retry deferred minimal pings that never got a finalized followup."""
+    while True:
+        time.sleep(10)
+        now = time.time()
+        to_process = []
+        with _PENDING_LOCK:
+            expired = [cam for cam, info in _PENDING.items()
+                       if now - info["deferred_at"] > 45]
+            for cam in expired:
+                to_process.append((cam, _PENDING.pop(cam)))
+        for cam, info in to_process:
+            try:
+                _process_deferred(cam, info["timestamp_ms"], info["location_uuid"])
+            except Exception as e:
+                log.warning(f"Sweeper exception for {cam}: {e}")
 
 
 @app.route("/debug", methods=["GET"])
@@ -520,11 +587,22 @@ def webhook():
 
         # Rules Engine fires twice per event: a minimal "first ping" (no eventUuid,
         # no seekpoints, no tu URLs) then a finalized payload ~5-30s later with all
-        # the media handles we need. Skip the minimal one — it has nothing fetchable.
+        # the media handles we need. Stash the minimal one in _PENDING; the sweeper
+        # will process it via rhombus analyze if no finalized followup arrives in 45s.
         if not event_uuid and not seekpoint_tu:
             log.info(f"Minimal payload on {camera_uuid} — deferring, awaiting finalized event")
+            with _PENDING_LOCK:
+                _PENDING[camera_uuid] = {
+                    "timestamp_ms": timestamp_ms,
+                    "location_uuid": location_uuid,
+                    "deferred_at": time.time(),
+                }
             event.update(status="deferred", reason="awaiting finalized event")
             return jsonify({"status": "deferred", "reason": "awaiting finalized event"}), 200
+
+        # Finalized ping — cancel any pending sweeper entry for this camera.
+        with _PENDING_LOCK:
+            _PENDING.pop(camera_uuid, None)
 
         log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
 
@@ -720,6 +798,8 @@ def dashboard():
 def health():
     return jsonify({"status": "ok"}), 200
 
+
+threading.Thread(target=_pending_sweeper, daemon=True, name="pending-sweeper").start()
 
 if __name__ == "__main__":
     get_model()
