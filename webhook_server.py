@@ -226,13 +226,21 @@ def refresh_tu_url(camera_uuid: str, timestamp_ms: int, window_sec: int = 10) ->
 
 
 def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
-              region: str = "us-east-2", seekpoint_tu: str = "") -> Path | None:
-    """Get a frame for YOLO — tries multiple strategies in decreasing freshness."""
+              region: str = "us-east-2", seekpoint_tu: str = "") -> tuple[Path | None, bool]:
+    """Get a frame for YOLO — tries multiple strategies in decreasing freshness.
+
+    Returns (path, was_pre_cropped). `was_pre_cropped` is True only for the
+    Rhombus `tu` thumbnail path, which delivers a pre-cropped image zoomed
+    in on the detected object. All other sources return the full sensor
+    frame — the caller should self-crop those using the webhook's bbox
+    hints before running inference.
+    """
     # Strategy 1: webhook-delivered tu URL — fastest path when fresh (no extra API call)
+    # Note: Rhombus returns a *cropped* thumbnail here (query params x/y/w/h).
     if seekpoint_tu:
         frame = download_media(seekpoint_tu)
         if frame:
-            return frame
+            return frame, True
         log.info("Webhook tu URL expired — falling back to rhombus analyze")
 
     # Strategy 2: shell out to `rhombus analyze footage` — reads from recorded
@@ -241,12 +249,12 @@ def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
     # .dash-internal.rhombussystems.com endpoint that Python requests cannot.
     frame = download_via_analyze(camera_uuid, timestamp_ms)
     if frame:
-        return frame
+        return frame, False
 
     # Strategy 3: rhombus alert thumb (works only for promoted alert UUIDs)
     frame = download_via_cli(event_uuid)
     if frame:
-        return frame
+        return frame, False
 
     # Strategy 4: re-query seekpoints for a freshly-signed tu URL
     fresh_tu = refresh_tu_url(camera_uuid, timestamp_ms)
@@ -254,28 +262,80 @@ def get_frame(camera_uuid: str, timestamp_ms: int, event_uuid: str = "",
         frame = download_media(fresh_tu)
         if frame:
             log.info("Recovered frame via refreshed tu URL")
-            return frame
+            return frame, True
 
     # Strategy 5: metadata URL (only if event promoted to an alert)
     if event_uuid:
         frame = download_media(f"{MEDIA_API}/media/metadata/{region}/{event_uuid}.jpeg")
         if frame:
-            return frame
+            return frame, False
 
     log.warning("All image fetch methods failed.")
-    return None
+    return None, False
 
 
-def run_detection(image_path: Path):
+def extract_motion_bbox(payload: dict) -> tuple[int, int, int, int] | None:
+    """Union all MOTION_CAR boundingBoxes in the payload into one (l, t, r, b) in permyriad.
+
+    The payload contains a boundingBoxes[] array with per-frame crops as the
+    object moves across the scene. Unioning them gives us a rectangle that
+    covers the object's full trajectory — roughly the region YOLO should
+    focus on. Returns None if no MOTION_CAR boxes are present.
+    """
+    events = payload.get("deviceEvents") or []
+    if not events:
+        return None
+    motion_boxes = [b for b in events[0].get("boundingBoxes", [])
+                    if b.get("activity") == "MOTION_CAR"]
+    if not motion_boxes:
+        return None
+    l = min(b["left"]   for b in motion_boxes)
+    t = min(b["top"]    for b in motion_boxes)
+    r = max(b["right"]  for b in motion_boxes)
+    b = max(b["bottom"] for b in motion_boxes)
+    return (l, t, r, b)
+
+
+def run_detection(image_path: Path, crop_permyriad: tuple[int, int, int, int] | None = None):
+    """Run YOLO and return detections in FULL-FRAME coordinates.
+
+    If `crop_permyriad` is given (tuple of l, t, r, b in 0..10000 units), crops
+    the image to that region + 15% padding before inference, then maps
+    detection boxes back to the original full-frame coordinate space. This is
+    useful when we pulled the full sensor frame via `rhombus analyze` — YOLO
+    sees the vehicle bigger if we narrow its view first.
+    """
     image = Image.open(image_path).convert("RGB")
     img_w, img_h = image.size
-    results = get_model().predict(source=image, conf=THRESHOLD, verbose=False)[0]
+    crop_x0 = crop_y0 = 0
+    infer_image = image
+    if crop_permyriad:
+        l, t, r, b = crop_permyriad
+        bw, bh = r - l, b - t
+        pad_l = max(0, l - int(bw * 0.15))
+        pad_t = max(0, t - int(bh * 0.15))
+        pad_r = min(10000, r + int(bw * 0.15))
+        pad_b = min(10000, b + int(bh * 0.15))
+        x0 = int(pad_l / 10000 * img_w)
+        y0 = int(pad_t / 10000 * img_h)
+        x1 = int(pad_r / 10000 * img_w)
+        y1 = int(pad_b / 10000 * img_h)
+        if x1 - x0 > 32 and y1 - y0 > 32:
+            infer_image = image.crop((x0, y0, x1, y1))
+            crop_x0, crop_y0 = x0, y0
+            log.info(f"Self-cropped full frame {img_w}x{img_h} → ({x0},{y0})-({x1},{y1}) "
+                     f"[{x1 - x0}x{y1 - y0}] before YOLO")
+    results = get_model().predict(source=infer_image, conf=THRESHOLD, verbose=False)[0]
     detections = []
-    for b in results.boxes:
-        label = get_model().names[int(b.cls[0])]
-        conf  = float(b.conf[0])
-        x0, y0, x1, y1 = b.xyxy[0].tolist()
-        detections.append((label, conf, x0, y0, x1, y1, img_w, img_h))
+    for box in results.boxes:
+        label = get_model().names[int(box.cls[0])]
+        conf  = float(box.conf[0])
+        x0, y0, x1, y1 = box.xyxy[0].tolist()
+        # Map crop-space coords back to the full original image.
+        detections.append((label, conf,
+                           x0 + crop_x0, y0 + crop_y0,
+                           x1 + crop_x0, y1 + crop_y0,
+                           img_w, img_h))
     return detections
 
 
@@ -468,14 +528,17 @@ def webhook():
 
         log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
 
-        thumb = get_frame(camera_uuid, timestamp_ms, event_uuid or "", region, seekpoint_tu)
+        thumb, pre_cropped = get_frame(camera_uuid, timestamp_ms, event_uuid or "", region, seekpoint_tu)
 
         if not thumb or not thumb.exists():
             log.warning("Could not obtain image.")
             event.update(status="error", reason="media URL expired or not yet available")
             return jsonify({"status": "error", "reason": "image unavailable"}), 200
 
-        detections = run_detection(thumb)
+        # If we pulled a full sensor frame (not the Rhombus-cropped tu thumbnail),
+        # crop to the motion region so YOLO sees the vehicle at useful resolution.
+        crop_hint = None if pre_cropped else extract_motion_bbox(payload)
+        detections = run_detection(thumb, crop_permyriad=crop_hint)
         forklifts  = [d for d in detections if d[0] == "forklift"]
         event["detections"] = len(detections)
 
