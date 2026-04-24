@@ -196,6 +196,42 @@ def download_via_analyze(camera_uuid: str, timestamp_ms: int, window_ms: int = 3
     return None
 
 
+def analyze_event_frames(camera_uuid: str, timestamp_ms: int, duration_ms: int) -> list[tuple[Path, int]]:
+    """Fetch all frames across the event window. Returns [(path, frame_timestamp_ms), ...].
+
+    Uses --fill so frames are evenly spaced (~2s apart) regardless of seekpoint density.
+    duration_ms is capped at 30s to bound cost.
+    """
+    duration_ms = min(duration_ms, 30_000)
+    tmpdir = tempfile.mkdtemp(prefix="frames-")
+    try:
+        result = subprocess.run(
+            ["rhombus", "analyze", "footage", camera_uuid,
+             "--start", str(timestamp_ms),
+             "--end",   str(timestamp_ms + duration_ms),
+             "--fill", "--raw", "--output", tmpdir],
+            env=_cli_env(), capture_output=True, text=True, timeout=60,
+        )
+        manifest_path = Path(tmpdir) / "manifest.json"
+        if manifest_path.exists():
+            manifest = json.loads(manifest_path.read_text())
+            frames = []
+            for cam_entry in manifest:
+                for f in cam_entry.get("frames", []):
+                    p = Path(f["path"])
+                    if p.exists() and p.stat().st_size > 1000:
+                        frames.append((p, f["timestampMs"]))
+            if frames:
+                log.info(f"analyze_event_frames: {len(frames)} frames over {duration_ms / 1000:.0f}s")
+                return frames
+        log.warning(f"analyze_event_frames: no frames. stderr: {result.stderr[:300]}")
+    except subprocess.TimeoutExpired:
+        log.warning("analyze_event_frames timed out")
+    except Exception as e:
+        log.warning(f"analyze_event_frames exception: {e}")
+    return []
+
+
 def refresh_tu_url(camera_uuid: str, timestamp_ms: int, window_sec: int = 10) -> str:
     """Re-query getCameraFootageSeekpointsV2 for a freshly-signed tu URL near timestamp_ms.
 
@@ -606,19 +642,47 @@ def webhook():
 
         log.info(f"Vehicle event on camera {camera_uuid} at {timestamp_ms} — fetching frame (tu={bool(seekpoint_tu)})...")
 
-        thumb, pre_cropped = get_frame(camera_uuid, timestamp_ms, event_uuid or "", region, seekpoint_tu)
+        crop_hint = extract_motion_bbox(payload)
+        device_events = payload.get("deviceEvents") or [{}]
+        duration_sec  = min(device_events[0].get("durationSec", 10), 30)
 
-        if not thumb or not thumb.exists():
-            log.warning("Could not obtain image.")
-            event.update(status="error", reason="media URL expired or not yet available")
+        # Build the frame list to scan. Start with the tu URL fast path (pre-cropped,
+        # no extra API call) then fill the full event window via rhombus analyze.
+        # Each entry is (path, frame_timestamp_ms, is_pre_cropped).
+        frames_to_scan: list[tuple[Path, int, bool]] = []
+
+        if seekpoint_tu:
+            tu_frame = download_media(seekpoint_tu)
+            if tu_frame:
+                frames_to_scan.append((tu_frame, timestamp_ms, True))
+            else:
+                log.info("Webhook tu URL expired — scanning full event window")
+
+        event_frames = analyze_event_frames(camera_uuid, timestamp_ms, duration_sec * 1000)
+        for p, fts in event_frames:
+            frames_to_scan.append((p, fts, False))
+
+        if not frames_to_scan:
+            log.warning("Could not obtain any frames.")
+            event.update(status="error", reason="media unavailable")
             return jsonify({"status": "error", "reason": "image unavailable"}), 200
 
-        # If we pulled a full sensor frame (not the Rhombus-cropped tu thumbnail),
-        # crop to the motion region so YOLO sees the vehicle at useful resolution.
-        crop_hint = None if pre_cropped else extract_motion_bbox(payload)
-        detections = run_detection(thumb, crop_permyriad=crop_hint)
-        forklifts  = [d for d in detections if d[0] == "forklift"]
-        event["detections"] = len(detections)
+        forklifts: list = []
+        det_timestamp_ms = timestamp_ms
+        total_detections = 0
+
+        for frame_path, frame_ts, pre_cropped in frames_to_scan:
+            hint = None if pre_cropped else crop_hint
+            dets = run_detection(frame_path, crop_permyriad=hint)
+            total_detections += len(dets)
+            hits = [d for d in dets if d[0] == "forklift"]
+            if hits:
+                forklifts = hits
+                det_timestamp_ms = frame_ts
+                log.info(f"Forklift found at frame ts={frame_ts} ({frames_to_scan.index((frame_path, frame_ts, pre_cropped)) + 1}/{len(frames_to_scan)})")
+                break
+
+        event["detections"] = total_detections
 
         if not forklifts:
             log.info("No forklift detected.")
@@ -628,8 +692,8 @@ def webhook():
         best_conf = max(f[1] for f in forklifts)
         log.info(f"Forklift detected! {len(forklifts)} instance(s), best conf {best_conf:.1%}. Creating annotations...")
         log_detection(camera_uuid, event_uuid or "", forklifts)
-        sp_resp = create_seekpoint(camera_uuid, timestamp_ms, best_conf, location_uuid)
-        bb_resp = create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
+        sp_resp = create_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
+        bb_resp = create_bounding_boxes(camera_uuid, det_timestamp_ms, forklifts)
         log.info(f"Seekpoint write: {sp_resp}  |  Bbox write: {bb_resp}")
 
         event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf)
