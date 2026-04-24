@@ -381,7 +381,7 @@ def create_seekpoint(camera_uuid: str, timestamp_ms: int, confidence: float = 0.
         "timestampMs": timestamp_ms,
         "name":        "Forklift Detection",
         "description": f"YOLO forklift detection — {confidence:.1%} confidence",
-        "color":       "GREEN",
+        "color":       "PURPLE",
     }
     if location_uuid:
         sp["locationUuid"] = location_uuid
