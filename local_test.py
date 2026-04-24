@@ -90,16 +90,20 @@ def run(payload: dict, dry_run: bool, frame_override: Path | None = None):
 
     if frame_override:
         thumb = frame_override
+        pre_cropped = True   # assume user already cropped their test image
         print(f"using local frame: {thumb}")
     else:
-        thumb = ws.get_frame(cam, ts, ev or "", region, tu)
+        thumb, pre_cropped = ws.get_frame(cam, ts, ev or "", region, tu)
     if not thumb:
         print("❌ no frame")
         return
     size = thumb.stat().st_size
-    print(f"✅ got frame: {thumb}  ({size} bytes)")
+    print(f"✅ got frame: {thumb}  ({size} bytes, pre_cropped={pre_cropped})")
 
-    detections = ws.run_detection(thumb)
+    crop_hint = None if pre_cropped else ws.extract_motion_bbox(payload)
+    if crop_hint:
+        print(f"   crop hint (permyriad l,t,r,b): {crop_hint}")
+    detections = ws.run_detection(thumb, crop_permyriad=crop_hint)
     forklifts = [d for d in detections if d[0] == "forklift"]
     print(f"detections={len(detections)}  forklifts={len(forklifts)}")
     for i, (label, conf, x0, y0, x1, y1, w, h) in enumerate(detections):
