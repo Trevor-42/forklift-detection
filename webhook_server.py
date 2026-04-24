@@ -502,15 +502,26 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str) -
         "reason":       "deferred fallback",
     }
     try:
-        frame = download_via_analyze(camera_uuid, timestamp_ms)
-        if not frame or not frame.exists():
-            log.warning(f"Sweeper: no frame for deferred event on {camera_uuid}")
-            event.update(status="error", reason="deferred: frame unavailable")
+        # No durationSec in the minimal ping — use 20s default (~10 frames at 2s intervals).
+        frames = analyze_event_frames(camera_uuid, timestamp_ms, 20_000)
+        if not frames:
+            log.warning(f"Sweeper: no frames for deferred event on {camera_uuid}")
+            event.update(status="error", reason="deferred: frames unavailable")
             return
-        # No bbox hint — the minimal ping carries no boundingBoxes, so run on the full frame.
-        detections = run_detection(frame, crop_permyriad=None)
-        forklifts   = [d for d in detections if d[0] == "forklift"]
-        event["detections"] = len(detections)
+        # No bbox hint — minimal ping carries no boundingBoxes.
+        forklifts: list = []
+        det_timestamp_ms = timestamp_ms
+        total_detections = 0
+        for frame_path, frame_ts in frames:
+            dets = run_detection(frame_path, crop_permyriad=None)
+            total_detections += len(dets)
+            hits = [d for d in dets if d[0] == "forklift"]
+            if hits:
+                forklifts = hits
+                det_timestamp_ms = frame_ts
+                log.info(f"Sweeper: forklift at frame ts={frame_ts} ({frames.index((frame_path, frame_ts)) + 1}/{len(frames)})")
+                break
+        event["detections"] = total_detections
         if not forklifts:
             log.info(f"Sweeper: no forklift on deferred event for {camera_uuid}")
             event.update(status="ok", forklift=False)
@@ -518,8 +529,8 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str) -
         best_conf = max(f[1] for f in forklifts)
         log.info(f"Sweeper: forklift! {len(forklifts)} instance(s) at {best_conf:.1%} on {camera_uuid}")
         log_detection(camera_uuid, "", forklifts)
-        sp_resp = create_seekpoint(camera_uuid, timestamp_ms, best_conf, location_uuid)
-        bb_resp = create_bounding_boxes(camera_uuid, timestamp_ms, forklifts)
+        sp_resp = create_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
+        bb_resp = create_bounding_boxes(camera_uuid, det_timestamp_ms, forklifts)
         log.info(f"Sweeper seekpoint: {sp_resp}  |  bbox: {bb_resp}")
         event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf)
     finally:
