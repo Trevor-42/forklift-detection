@@ -243,8 +243,9 @@ def analyze_event_frames(camera_uuid: str, timestamp_ms: int, duration_ms: int) 
                 log.info(f"analyze_event_frames: {len(frames)} frames over {duration_ms / 1000:.0f}s")
                 return frames
         log.warning(f"analyze_event_frames: no frames. stderr: {result.stderr[:300]}")
-    except subprocess.TimeoutExpired:
-        log.warning("analyze_event_frames timed out")
+    except subprocess.TimeoutExpired as e:
+        stderr = (e.stderr or "").strip()[:400] if hasattr(e, "stderr") else ""
+        log.warning(f"analyze_event_frames timed out for {camera_uuid}. stderr: {stderr or '(none)'}")
     except Exception as e:
         log.warning(f"analyze_event_frames exception: {e}")
     return []
