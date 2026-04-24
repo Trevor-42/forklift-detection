@@ -8,9 +8,9 @@ bounding boxes.
 
 - **Cloud Run service:** `forklift-detection`
   - Project: `forklift-detection-i2m`
-  - Region: `us-central1`
-  - URL: `https://forklift-detection-215390028467.us-central1.run.app`
-  - Deploy: `gcloud run deploy forklift-detection --source . --region us-central1 --project forklift-detection-i2m`
+  - Region: `us-east1` (moved from us-central1 — closer to Rhombus dash servers in OCI Ashburn VA)
+  - URL: changes after region migration — check `gcloud run services describe forklift-detection --region us-east1 --project forklift-detection-i2m`
+  - Deploy: `gcloud run deploy forklift-detection --source . --region us-east1 --project forklift-detection-i2m --min-instances 1`
 - **Runtime:** Flask + gunicorn (`--workers 1 --threads 4 --timeout 120`)
 - **mTLS:** `/run/secrets/crt/client-crt` + `/run/secrets/key/client-key` in prod; `~/.rhombus/certs/i2M/` locally
 - **Secrets:** Cloud Run has `RHOMBUS_API_KEY` mounted. Locally, `.env` (gitignored) or `~/.rhombus/credentials` profile `i2M`.

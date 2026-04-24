@@ -497,7 +497,7 @@ _BOOT_TS = time.time()
 # so frames are ready (or nearly ready) when the finalized second ping arrives.
 _PENDING_LOCK = threading.Lock()
 _PENDING: dict = {}  # camera_uuid -> {timestamp_ms, location_uuid, deferred_at, frames_future}
-_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="prefetch")
+_EXECUTOR = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="prefetch")
 
 
 def _record_event(event: dict) -> None:
