@@ -4,10 +4,13 @@ Rhombus Forklift Detection — Webhook Server
 Receives MOTION_CAR alerts from Rhombus, runs YOLO forklift detection,
 and writes a blue seekpoint + bounding box back to the camera on any hit.
 
-Deploy to Render/Railway and register the URL in Rhombus:
-  rhombus webhook-integrations update-webhook-integration-v2 \
+Deploy to Cloud Run and register the URL in Rhombus:
+  gcloud run deploy forklift-detection --source . --region us-east1 \
+    --project forklift-detection-i2m --min-instances 1 --memory 2Gi
+
+  rhombus webhook-integrations update-webhook-integration \
     --profile i2M \
-    --cli-input-json '{"webhookUrl":"https://your-app.onrender.com/webhook","disabled":false}'
+    --webhook-settings '{"webhookUrl":"https://<service-url>/webhook","disabled":false}'
 
 Environment variables required:
   RHOMBUS_API_KEY   — i2M org API key
@@ -22,6 +25,7 @@ import csv
 import json
 import logging
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -54,7 +58,7 @@ MEDIA_API            = "https://mediaapi-v2.rhombussystems.com"
 CERT_FILE            = Path("/run/secrets/crt/client-crt")
 KEY_FILE             = Path("/run/secrets/key/client-key")
 
-model = None
+model: "YOLO | None" = None
 
 # Per-camera scale factors set via /calibrate — permyriad per inch.
 # Persists in memory until restart; also exposed via /calibrate/scales for copy-paste into env vars.
@@ -63,8 +67,10 @@ _CAMERA_SCALES: dict[str, float] = {}
 for _entry in os.environ.get("CAMERA_SCALES", "").split(","):
     if ":" in _entry:
         _uid, _val = _entry.strip().split(":", 1)
-        try: _CAMERA_SCALES[_uid] = float(_val)
-        except ValueError: pass
+        try:
+            _CAMERA_SCALES[_uid] = float(_val)
+        except ValueError:
+            logging.getLogger(__name__).warning(f"Skipping bad CAMERA_SCALES entry: {_entry!r}")
 
 
 def _cert():
@@ -110,6 +116,8 @@ def rhombus_post(endpoint: str, payload: dict):
         verify=False,
         timeout=10,
     )
+    if not resp.ok:
+        log.warning(f"rhombus_post {endpoint} returned HTTP {resp.status_code}: {resp.text[:200]}")
     return resp.json()
 
 
@@ -139,6 +147,7 @@ def download_media(url: str) -> Path | None:
 
 
 _CLI_ENV_READY = False
+_CLI_ENV_LOCK = threading.Lock()
 
 
 def _cli_env() -> dict:
@@ -156,23 +165,25 @@ def _cli_env() -> dict:
     }
     if _CLI_ENV_READY:
         return env
-    try:
-        config_dir = Path("/tmp/.rhombus")
-        cert_dir   = config_dir / "certs" / "default"
-        cert_dir.mkdir(parents=True, exist_ok=True)
-        if CERT_FILE.exists() and KEY_FILE.exists():
-            import shutil
-            shutil.copy(CERT_FILE, cert_dir / "client.crt")
-            shutil.copy(KEY_FILE,  cert_dir / "client.key")
-        (config_dir / "credentials").write_text(
-            "[default]\nauth_type = cert\n"
-            f"api_key = {RHOMBUS_API_KEY}\n"
-            f"key_file = {cert_dir}/client.key\n"
-            f"cert_file = {cert_dir}/client.crt\n"
-        )
-        _CLI_ENV_READY = True
-    except Exception as e:
-        log.warning(f"CLI env setup failed: {e}")
+    with _CLI_ENV_LOCK:
+        if _CLI_ENV_READY:  # re-check after acquiring lock
+            return env
+        try:
+            config_dir = Path("/tmp/.rhombus")
+            cert_dir   = config_dir / "certs" / "default"
+            cert_dir.mkdir(parents=True, exist_ok=True)
+            if CERT_FILE.exists() and KEY_FILE.exists():
+                shutil.copy(CERT_FILE, cert_dir / "client.crt")
+                shutil.copy(KEY_FILE,  cert_dir / "client.key")
+            (config_dir / "credentials").write_text(
+                "[default]\nauth_type = cert\n"
+                f"api_key = {RHOMBUS_API_KEY}\n"
+                f"key_file = {cert_dir}/client.key\n"
+                f"cert_file = {cert_dir}/client.crt\n"
+            )
+            _CLI_ENV_READY = True
+        except Exception as e:
+            log.warning(f"CLI env setup failed: {e}")
     return env
 
 
@@ -216,13 +227,19 @@ def download_via_analyze(camera_uuid: str, timestamp_ms: int, window_ms: int = 3
         )
         for p in sorted(Path(tmpdir).rglob("*.jpeg")):
             if p.stat().st_size > 1000:
+                # Copy to an individual temp file so tmpdir can be cleaned up.
+                tf = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
+                tf.write(p.read_bytes())
+                tf.close()
                 log.info(f"Fetched frame via rhombus analyze: {p.stat().st_size} bytes")
-                return p
+                return Path(tf.name)
         log.warning(f"rhombus analyze produced no frames. stderr: {result.stderr[:300]}")
     except subprocess.TimeoutExpired:
         log.warning("rhombus analyze timed out")
     except Exception as e:
         log.warning(f"rhombus analyze exception: {e}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return None
 
 
@@ -252,14 +269,24 @@ def analyze_event_frames(camera_uuid: str, timestamp_ms: int, duration_ms: int) 
                     if p.exists() and p.stat().st_size > 1000:
                         frames.append((p, f["timestampMs"]))
             if frames:
-                log.info(f"analyze_event_frames: {len(frames)} frames over {duration_ms / 1000:.0f}s")
-                return frames
+                # Copy each frame to an individual temp file so tmpdir can be cleaned up
+                # immediately — callers are responsible for unlinking the returned paths.
+                output_frames = []
+                for p, ts in frames:
+                    tf = tempfile.NamedTemporaryFile(suffix=".jpeg", delete=False)
+                    tf.write(p.read_bytes())
+                    tf.close()
+                    output_frames.append((Path(tf.name), ts))
+                log.info(f"analyze_event_frames: {len(output_frames)} frames over {duration_ms / 1000:.0f}s")
+                return output_frames
         log.warning(f"analyze_event_frames: no frames. stderr: {result.stderr[:300]}")
     except subprocess.TimeoutExpired as e:
         stderr = (e.stderr or "").strip()[:400] if hasattr(e, "stderr") else ""
         log.warning(f"analyze_event_frames timed out for {camera_uuid}. stderr: {stderr or '(none)'}")
     except Exception as e:
         log.warning(f"analyze_event_frames exception: {e}")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
     return []
 
 
@@ -443,8 +470,10 @@ def _parse_tu_bbox(tu: str) -> tuple[int, int, int, int] | None:
     try:
         from urllib.parse import urlparse, parse_qs
         qs = parse_qs(urlparse(tu).query)
-        x = int(qs["x"][0]); y = int(qs["y"][0])
-        w = int(qs["w"][0]); h = int(qs["h"][0])
+        x = int(qs["x"][0])
+        y = int(qs["y"][0])
+        w = int(qs["w"][0])
+        h = int(qs["h"][0])
         return (x, y, x + w, y + h)
     except Exception:
         return None
@@ -511,12 +540,13 @@ def check_near_miss(forklift_detections: list, human_bboxes: list[tuple[int,int,
 
 
 def log_near_miss(camera_uuid: str, timestamp_ms: int, forklift_conf: float):
-    write_header = not NEAR_MISS_LOG_FILE.exists()
-    with open(NEAR_MISS_LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow(["timestamp", "camera_uuid", "event_timestamp_ms", "forklift_confidence"])
-        writer.writerow([datetime.now().isoformat(), camera_uuid, timestamp_ms, f"{forklift_conf:.1%}"])
+    with _CSV_LOCK:
+        write_header = not NEAR_MISS_LOG_FILE.exists()
+        with open(NEAR_MISS_LOG_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["timestamp", "camera_uuid", "event_timestamp_ms", "forklift_confidence"])
+            writer.writerow([datetime.now().isoformat(), camera_uuid, timestamp_ms, f"{forklift_conf:.1%}"])
 
 
 def create_bounding_boxes(camera_uuid: str, timestamp_ms: int, detections: list):
@@ -542,13 +572,14 @@ def create_bounding_boxes(camera_uuid: str, timestamp_ms: int, detections: list)
 
 
 def log_detection(camera_uuid: str, alert_uuid: str, detections: list):
-    write_header = not LOG_FILE.exists()
-    with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        if write_header:
-            writer.writerow(["timestamp", "camera_uuid", "alert_uuid", "label", "confidence"])
-        for label, conf, *_ in detections:
-            writer.writerow([datetime.now().isoformat(), camera_uuid, alert_uuid, label, f"{conf:.1%}"])
+    with _CSV_LOCK:
+        write_header = not LOG_FILE.exists()
+        with open(LOG_FILE, "a", newline="") as f:
+            writer = csv.writer(f)
+            if write_header:
+                writer.writerow(["timestamp", "camera_uuid", "alert_uuid", "label", "confidence"])
+            for label, conf, *_ in detections:
+                writer.writerow([datetime.now().isoformat(), camera_uuid, alert_uuid, label, f"{conf:.1%}"])
 
 
 def parse_payload(payload: dict):
@@ -591,6 +622,18 @@ def parse_payload(payload: dict):
     timestamp_ms = payload.get("timestampMs", int(time.time() * 1000))
     return camera_uuid, event_uuid, timestamp_ms, "us-east-2", "", payload.get("locationUuid", "")
 
+
+_CSV_LOCK = threading.Lock()  # guards both LOG_FILE and NEAR_MISS_LOG_FILE writes
+
+
+def _cleanup_temp_files(paths: list) -> None:
+    """Unlink a list of temp file Paths, ignoring errors."""
+    for p in paths:
+        try:
+            if p and Path(p).exists():
+                Path(p).unlink()
+        except Exception:
+            pass
 
 _last_payload: dict = {}
 
@@ -656,7 +699,7 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
         det_timestamp_ms = timestamp_ms
         total_detections = 0
         thumb_frame: Path | None = None
-        for frame_path, frame_ts in frames:
+        for frame_idx, (frame_path, frame_ts) in enumerate(frames):
             if thumb_frame is None:
                 thumb_frame = frame_path
             dets = run_detection(frame_path, crop_permyriad=None)
@@ -666,7 +709,7 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
                 forklifts = hits
                 det_timestamp_ms = frame_ts
                 thumb_frame = frame_path
-                log.info(f"Sweeper: forklift at frame ts={frame_ts} ({frames.index((frame_path, frame_ts)) + 1}/{len(frames)})")
+                log.info(f"Sweeper: forklift at frame ts={frame_ts} ({frame_idx + 1}/{len(frames)})")
                 break
         event["detections"] = total_detections
         if thumb_frame:
@@ -694,6 +737,7 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
     finally:
         event["latency_ms"] = int((time.time() - t_start) * 1000)
         _record_event(event)
+        _cleanup_temp_files([p for p, _ in frames] if frames else [])
 
 
 def _pending_sweeper() -> None:
@@ -715,14 +759,29 @@ def _pending_sweeper() -> None:
                 log.warning(f"Sweeper exception for {cam}: {e}")
 
 
+_DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
+
+
+def _check_debug_token() -> bool:
+    """Return True if the request carries a valid DEBUG_TOKEN (or none is set)."""
+    if not _DEBUG_TOKEN:
+        return True  # unset = unrestricted (useful in dev)
+    return request.args.get("token") == _DEBUG_TOKEN or \
+           request.headers.get("X-Debug-Token") == _DEBUG_TOKEN
+
+
 @app.route("/debug", methods=["GET"])
 def debug():
+    if not _check_debug_token():
+        return jsonify({"error": "unauthorized"}), 403
     return jsonify(_last_payload), 200
 
 
 @app.route("/debug/cert", methods=["GET"])
 def debug_cert():
     """Diagnose cert mounting + mediaapi-v2 auth."""
+    if not _check_debug_token():
+        return jsonify({"error": "unauthorized"}), 403
     info = {
         "cert_path": str(CERT_FILE),
         "key_path": str(KEY_FILE),
@@ -767,7 +826,17 @@ def webhook():
     t_start = time.time()
     payload = request.get_json(silent=True) or {}
     _last_payload = payload
-    log.info(f"Webhook received: {json.dumps(payload)}")
+    # Log a condensed summary — avoid dumping the full payload which can contain
+    # large base64 blobs and sensitive media URLs.
+    _events = payload.get("deviceEvents") or []
+    _ev0 = _events[0] if _events else {}
+    log.info(
+        f"Webhook received: camera={_ev0.get('deviceUuid','?')} "
+        f"eventUuid={_ev0.get('eventUuid','—')} "
+        f"ts={_ev0.get('timestampMs','?')} "
+        f"seekpoints={len(_ev0.get('seekpoints', []))} "
+        f"bboxes={len(_ev0.get('boundingBoxes', []))}"
+    )
 
     camera_uuid, event_uuid, timestamp_ms, region, seekpoint_tu, location_uuid = parse_payload(payload)
 
@@ -787,6 +856,7 @@ def webhook():
         "thumb_b64":   "",
         "near_miss":   False,
     }
+    frames_to_scan: list[tuple[Path, int, bool]] = []  # initialised here so finally can clean up
 
     try:
         if not camera_uuid:
@@ -827,7 +897,6 @@ def webhook():
         # Build the frame list to scan. Start with the tu URL fast path (pre-cropped,
         # no extra API call) then fill the full event window via rhombus analyze.
         # Each entry is (path, frame_timestamp_ms, is_pre_cropped).
-        frames_to_scan: list[tuple[Path, int, bool]] = []
 
         if seekpoint_tu:
             tu_frame = download_media(seekpoint_tu)
@@ -867,7 +936,7 @@ def webhook():
         total_detections = 0
         thumb_frame: Path | None = None
 
-        for frame_path, frame_ts, pre_cropped in frames_to_scan:
+        for frame_idx, (frame_path, frame_ts, pre_cropped) in enumerate(frames_to_scan):
             if thumb_frame is None:
                 thumb_frame = frame_path
             hint = None if pre_cropped else crop_hint
@@ -878,7 +947,7 @@ def webhook():
                 forklifts = hits
                 det_timestamp_ms = frame_ts
                 thumb_frame = frame_path
-                log.info(f"Forklift found at frame ts={frame_ts} ({frames_to_scan.index((frame_path, frame_ts, pre_cropped)) + 1}/{len(frames_to_scan)})")
+                log.info(f"Forklift found at frame ts={frame_ts} ({frame_idx + 1}/{len(frames_to_scan)})")
                 break
 
         event["detections"] = total_detections
@@ -911,6 +980,8 @@ def webhook():
     finally:
         event["latency_ms"] = int((time.time() - t_start) * 1000)
         _record_event(event)
+        # Clean up all temp frame files accumulated during this request.
+        _cleanup_temp_files([p for p, _, __ in frames_to_scan])
 
 
 @app.route("/stats.json", methods=["GET"])
@@ -1093,18 +1164,41 @@ def dashboard():
     return Response(DASHBOARD_HTML, mimetype="text/html")
 
 
+_CALIBRATE_FRAME_CACHE: dict[str, tuple[float, bytes]] = {}  # camera_uuid -> (fetched_at, jpeg_bytes)
+_CALIBRATE_FRAME_LOCK = threading.Lock()
+_CALIBRATE_FRAME_TTL = 30  # seconds — re-use cached frame within this window
+
+
 @app.route("/calibrate/frame")
 def calibrate_frame():
-    """Fetch and serve a recent frame from the requested camera as JPEG."""
+    """Fetch and serve a recent frame from the requested camera as JPEG.
+
+    Results are cached per camera for 30 s to prevent concurrent CLI subprocesses
+    from spawning if the user rapidly hits the endpoint.
+    """
     from flask import Response, abort
     camera_uuid = request.args.get("camera", "")
     if not camera_uuid:
         abort(400, "camera param required")
-    ts = int(time.time() * 1000) - 30_000  # 30s ago
+
+    now = time.time()
+    with _CALIBRATE_FRAME_LOCK:
+        cached = _CALIBRATE_FRAME_CACHE.get(camera_uuid)
+        if cached and now - cached[0] < _CALIBRATE_FRAME_TTL:
+            return Response(cached[1], mimetype="image/jpeg")
+
+    ts = int(now * 1000) - 30_000  # 30s ago
     frame = download_via_analyze(camera_uuid, ts, window_ms=10_000)
     if not frame:
         abort(503, "Could not fetch frame — camera may be offline or footage unavailable")
-    return Response(frame.read_bytes(), mimetype="image/jpeg")
+    try:
+        data = frame.read_bytes()
+    finally:
+        frame.unlink(missing_ok=True)
+
+    with _CALIBRATE_FRAME_LOCK:
+        _CALIBRATE_FRAME_CACHE[camera_uuid] = (now, data)
+    return Response(data, mimetype="image/jpeg")
 
 
 @app.route("/calibrate/save", methods=["POST"])
@@ -1115,8 +1209,9 @@ def calibrate_save():
     scale = data.get("permyriad_per_inch")
     if not camera_uuid or scale is None:
         return jsonify({"error": "camera_uuid and permyriad_per_inch required"}), 400
-    _CAMERA_SCALES[camera_uuid] = float(scale)
-    log.info(f"Calibration saved: {camera_uuid} → {scale:.4f} permyriad/inch")
+    scale_f = float(scale)
+    _CAMERA_SCALES[camera_uuid] = scale_f
+    log.info(f"Calibration saved: {camera_uuid} → {scale_f:.4f} permyriad/inch")
     return jsonify({"status": "ok", "camera_uuid": camera_uuid, "permyriad_per_inch": scale})
 
 
