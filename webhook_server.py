@@ -56,6 +56,16 @@ KEY_FILE             = Path("/run/secrets/key/client-key")
 
 model = None
 
+# Per-camera scale factors set via /calibrate — permyriad per inch.
+# Persists in memory until restart; also exposed via /calibrate/scales for copy-paste into env vars.
+_CAMERA_SCALES: dict[str, float] = {}
+# Pre-populate from env var: CAMERA_SCALES=uuid1:0.042,uuid2:0.038
+for _entry in os.environ.get("CAMERA_SCALES", "").split(","):
+    if ":" in _entry:
+        _uid, _val = _entry.strip().split(":", 1)
+        try: _CAMERA_SCALES[_uid] = float(_val)
+        except ValueError: pass
+
 
 def _cert():
     """Return (cert, key) tuple if available, else None."""
@@ -1081,6 +1091,215 @@ tick(); setInterval(tick, 2000);
 def dashboard():
     from flask import Response
     return Response(DASHBOARD_HTML, mimetype="text/html")
+
+
+@app.route("/calibrate/frame")
+def calibrate_frame():
+    """Fetch and serve a recent frame from the requested camera as JPEG."""
+    from flask import Response, abort
+    camera_uuid = request.args.get("camera", "")
+    if not camera_uuid:
+        abort(400, "camera param required")
+    ts = int(time.time() * 1000) - 30_000  # 30s ago
+    frame = download_via_analyze(camera_uuid, ts, window_ms=10_000)
+    if not frame:
+        abort(503, "Could not fetch frame — camera may be offline or footage unavailable")
+    return Response(frame.read_bytes(), mimetype="image/jpeg")
+
+
+@app.route("/calibrate/save", methods=["POST"])
+def calibrate_save():
+    """Store a permyriad_per_inch scale factor for a camera."""
+    data = request.get_json(silent=True) or {}
+    camera_uuid = data.get("camera_uuid", "")
+    scale = data.get("permyriad_per_inch")
+    if not camera_uuid or scale is None:
+        return jsonify({"error": "camera_uuid and permyriad_per_inch required"}), 400
+    _CAMERA_SCALES[camera_uuid] = float(scale)
+    log.info(f"Calibration saved: {camera_uuid} → {scale:.4f} permyriad/inch")
+    return jsonify({"status": "ok", "camera_uuid": camera_uuid, "permyriad_per_inch": scale})
+
+
+@app.route("/calibrate/scales")
+def calibrate_scales():
+    """Return stored scale factors and the env var string to persist them."""
+    env_str = ",".join(f"{k}:{v:.6f}" for k, v in _CAMERA_SCALES.items())
+    return jsonify({"scales": _CAMERA_SCALES, "env_var": f"CAMERA_SCALES={env_str}"})
+
+
+CALIBRATE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Forklift Detection — Camera Calibration</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font: 14px/1.6 -apple-system, system-ui, sans-serif; margin: 0; background: #0c0e13; color: #e6e8eb; }
+  header { padding: 16px 24px; background: #14181f; border-bottom: 1px solid #222833; display: flex; justify-content: space-between; align-items: center; }
+  h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  .row { display: flex; gap: 24px; align-items: flex-start; flex-wrap: wrap; }
+  .controls { min-width: 260px; }
+  label { display: block; color: #8b97a8; font-size: 11px; text-transform: uppercase; letter-spacing: .05em; margin: 16px 0 4px; }
+  input, select { width: 100%; box-sizing: border-box; background: #1a1f29; border: 1px solid #2a3040; border-radius: 6px; padding: 8px 10px; color: #e6e8eb; font-size: 13px; }
+  button { margin-top: 10px; width: 100%; padding: 10px; background: #a29bfe; color: #0c0e13; border: none; border-radius: 6px; font-size: 13px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #c4b5fd; }
+  button.secondary { background: #2a2f3a; color: #e6e8eb; margin-top: 6px; }
+  #canvas-wrap { position: relative; display: inline-block; }
+  canvas { border: 1px solid #222833; border-radius: 6px; cursor: crosshair; display: block; max-width: 100%; }
+  .dot { position: absolute; width: 12px; height: 12px; border-radius: 50%; margin: -6px 0 0 -6px; pointer-events: none; }
+  .dot.p1 { background: #f1c40f; }
+  .dot.p2 { background: #e74c3c; }
+  .result { margin-top: 16px; padding: 14px; background: #14181f; border: 1px solid #222833; border-radius: 8px; font-size: 13px; }
+  .result .big { font-size: 22px; font-weight: 600; color: #2ecc71; margin: 4px 0; }
+  .result code { background: #1a1f29; padding: 4px 8px; border-radius: 4px; font-size: 12px; }
+  .muted { color: #6b7585; font-size: 12px; }
+  .step { color: #8b97a8; font-size: 12px; margin: 6px 0; }
+  .step span { color: #e6e8eb; }
+  #msg { margin-top: 10px; font-size: 12px; color: #f1c40f; min-height: 18px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Camera Calibration — Pallet Reference</h1>
+  <a href="/dashboard" style="color:#a29bfe;font-size:13px;">← Dashboard</a>
+</header>
+<main>
+  <p class="muted">Click two points on a known object in the camera frame (e.g. two corners of a standard pallet = 48" apart). The tool calculates the permyriad-per-inch scale factor for speed estimation.</p>
+  <div class="row">
+    <div class="controls">
+      <label>Camera UUID</label>
+      <input id="camera" placeholder="paste camera UUID" />
+      <button onclick="loadFrame()">Load Frame</button>
+
+      <label>Step 1 — Click point A on image</label>
+      <div class="step">A: <span id="p1txt">not set</span></div>
+      <label>Step 2 — Click point B on image</label>
+      <div class="step">B: <span id="p2txt">not set</span></div>
+
+      <label>Real-world distance between A and B (inches)</label>
+      <input id="dist" type="number" value="48" min="1" />
+      <div class="muted" style="margin-top:4px">Standard pallet width = 48" &nbsp;|&nbsp; pallet depth = 40"</div>
+
+      <button onclick="compute()" style="margin-top:16px;background:#2ecc71;color:#0c0e13">Calculate Scale Factor</button>
+      <button class="secondary" onclick="reset()">Reset Points</button>
+      <div id="msg"></div>
+
+      <div id="result" style="display:none" class="result">
+        <div class="muted">Permyriad per inch</div>
+        <div class="big" id="scale_val">—</div>
+        <div class="muted" style="margin-top:8px">Set this as env var:</div>
+        <code id="env_hint">—</code>
+        <button onclick="saveScale()" style="margin-top:12px;background:#a29bfe;color:#0c0e13">Save to Server</button>
+      </div>
+    </div>
+
+    <div>
+      <div id="canvas-wrap">
+        <canvas id="cv" width="800" height="450"></canvas>
+      </div>
+    </div>
+  </div>
+</main>
+<script>
+let pts = [], scale = null, camUuid = '', imgNatW = 1, imgNatH = 1, canvW = 800, canvH = 450;
+
+async function loadFrame() {
+  camUuid = document.getElementById('camera').value.trim();
+  if (!camUuid) { msg('Enter a camera UUID first'); return; }
+  msg('Fetching frame…');
+  const cv = document.getElementById('cv');
+  const ctx = cv.getContext('2d');
+  ctx.fillStyle = '#14181f'; ctx.fillRect(0,0,cv.width,cv.height);
+  ctx.fillStyle = '#8b97a8'; ctx.font = '14px system-ui';
+  ctx.fillText('Loading…', cv.width/2-30, cv.height/2);
+  try {
+    const r = await fetch('/calibrate/frame?camera=' + encodeURIComponent(camUuid));
+    if (!r.ok) { msg('Frame unavailable: ' + await r.text()); return; }
+    const blob = await r.blob();
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    img.onload = () => {
+      imgNatW = img.naturalWidth; imgNatH = img.naturalHeight;
+      const aspect = imgNatW / imgNatH;
+      canvW = 800; canvH = Math.round(800 / aspect);
+      cv.width = canvW; cv.height = canvH;
+      ctx.drawImage(img, 0, 0, canvW, canvH);
+      msg('Frame loaded. Click two reference points.');
+      reset();
+    };
+    img.src = url;
+  } catch(e) { msg('Error: ' + e); }
+}
+
+document.getElementById('cv').addEventListener('click', e => {
+  if (pts.length >= 2) return;
+  const cv = document.getElementById('cv');
+  const rect = cv.getBoundingClientRect();
+  const cx = (e.clientX - rect.left) * (cv.width / rect.width);
+  const cy = (e.clientY - rect.top) * (cv.height / rect.height);
+  // Convert to permyriad
+  const px = Math.round(cx / cv.width * 10000);
+  const py = Math.round(cy / cv.height * 10000);
+  pts.push({cx, cy, px, py});
+  drawDot(cx, cy, pts.length === 1 ? 'p1' : 'p2');
+  document.getElementById(pts.length === 1 ? 'p1txt' : 'p2txt').textContent = `(${px}, ${py}) permyriad`;
+  if (pts.length === 2) msg('Both points set. Enter distance and click Calculate.');
+});
+
+function drawDot(cx, cy, cls) {
+  const wrap = document.getElementById('canvas-wrap');
+  const cv = document.getElementById('cv');
+  const rect = cv.getBoundingClientRect();
+  const scaleX = rect.width / cv.width;
+  const d = document.createElement('div');
+  d.className = 'dot ' + cls;
+  d.style.left = (cx * scaleX + rect.left - wrap.getBoundingClientRect().left) + 'px';
+  d.style.top = (cy * scaleX + rect.top - wrap.getBoundingClientRect().top) + 'px';
+  wrap.appendChild(d);
+}
+
+function compute() {
+  if (pts.length < 2) { msg('Click two points first'); return; }
+  const dist = parseFloat(document.getElementById('dist').value);
+  if (!dist || dist <= 0) { msg('Enter a valid distance'); return; }
+  const dx = pts[1].px - pts[0].px, dy = pts[1].py - pts[0].py;
+  const permyriadDist = Math.sqrt(dx*dx + dy*dy);
+  scale = permyriadDist / dist;
+  document.getElementById('scale_val').textContent = scale.toFixed(4) + ' permyriad/inch';
+  document.getElementById('env_hint').textContent = 'CAMERA_SCALES=' + camUuid + ':' + scale.toFixed(6);
+  document.getElementById('result').style.display = 'block';
+  msg('Scale factor calculated!');
+}
+
+async function saveScale() {
+  if (!scale) return;
+  const r = await fetch('/calibrate/save', {
+    method: 'POST', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({camera_uuid: camUuid, permyriad_per_inch: scale})
+  });
+  const d = await r.json();
+  msg(d.error || 'Saved to server ✓ (persists until restart — also set env var to make permanent)');
+}
+
+function reset() {
+  pts = []; scale = null;
+  document.getElementById('p1txt').textContent = 'not set';
+  document.getElementById('p2txt').textContent = 'not set';
+  document.getElementById('result').style.display = 'none';
+  document.querySelectorAll('.dot').forEach(d => d.remove());
+  msg('');
+}
+
+function msg(t) { document.getElementById('msg').textContent = t; }
+</script>
+</body></html>"""
+
+
+@app.route("/calibrate")
+def calibrate():
+    from flask import Response
+    return Response(CALIBRATE_HTML, mimetype="text/html")
 
 
 @app.route("/health", methods=["GET"])
