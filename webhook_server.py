@@ -43,14 +43,16 @@ log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-WEIGHTS         = Path(__file__).parent / "best.pt"
-LOG_FILE        = Path(__file__).parent / "detections.csv"
-THRESHOLD       = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.70"))
-RHOMBUS_API_KEY = os.environ.get("RHOMBUS_API_KEY", "")
-RHOMBUS_API     = "https://api2.rhombussystems.com/api"
-MEDIA_API       = "https://mediaapi-v2.rhombussystems.com"
-CERT_FILE       = Path("/run/secrets/crt/client-crt")
-KEY_FILE        = Path("/run/secrets/key/client-key")
+WEIGHTS              = Path(__file__).parent / "best.pt"
+LOG_FILE             = Path(__file__).parent / "detections.csv"
+NEAR_MISS_LOG_FILE   = Path(__file__).parent / "near_misses.csv"
+THRESHOLD            = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.70"))
+NEAR_MISS_THRESHOLD  = int(os.environ.get("NEAR_MISS_THRESHOLD", "2000"))  # permyriad proximity
+RHOMBUS_API_KEY      = os.environ.get("RHOMBUS_API_KEY", "")
+RHOMBUS_API          = "https://api2.rhombussystems.com/api"
+MEDIA_API            = "https://mediaapi-v2.rhombussystems.com"
+CERT_FILE            = Path("/run/secrets/crt/client-crt")
+KEY_FILE             = Path("/run/secrets/key/client-key")
 
 model = None
 
@@ -410,6 +412,103 @@ def create_seekpoint(camera_uuid: str, timestamp_ms: int, confidence: float = 0.
     })
 
 
+def create_near_miss_seekpoint(camera_uuid: str, timestamp_ms: int,
+                               forklift_conf: float, location_uuid: str = ""):
+    sp = {
+        "timestampMs": timestamp_ms,
+        "name":        "Near-Miss Alert",
+        "description": f"Forklift + human in close proximity — forklift conf {forklift_conf:.1%}",
+        "color":       "RED",
+    }
+    if location_uuid:
+        sp["locationUuid"] = location_uuid
+    return rhombus_post("camera/createCustomFootageSeekpoints", {
+        "cameraUuid": camera_uuid,
+        "footageSeekPoints": [sp],
+    })
+
+
+def _parse_tu_bbox(tu: str) -> tuple[int, int, int, int] | None:
+    """Extract (left, top, right, bottom) in permyriad from a tu URL's x/y/w/h params."""
+    try:
+        from urllib.parse import urlparse, parse_qs
+        qs = parse_qs(urlparse(tu).query)
+        x = int(qs["x"][0]); y = int(qs["y"][0])
+        w = int(qs["w"][0]); h = int(qs["h"][0])
+        return (x, y, x + w, y + h)
+    except Exception:
+        return None
+
+
+def get_human_bboxes(camera_uuid: str, timestamp_ms: int, window_sec: int = 15) -> list[tuple[int,int,int,int]]:
+    """Query getFootageSeekpointsV2 and return MOTION_HUMAN bboxes (permyriad) near timestamp_ms."""
+    try:
+        start_sec = max(0, (timestamp_ms // 1000) - window_sec)
+        resp = rhombus_post("camera/getFootageSeekpointsV2", {
+            "cameraUuid":       f"{camera_uuid}.v0",
+            "startTime":        start_sec,
+            "duration":         window_sec * 2,
+            "includeAnyMotion": True,
+        })
+        sps = resp.get("footageSeekPoints", []) if isinstance(resp, dict) else []
+        bboxes = []
+        for sp in sps:
+            if sp.get("a") != "MOTION_HUMAN":
+                continue
+            tu = sp.get("tu", "")
+            if not tu:
+                continue
+            bbox = _parse_tu_bbox(tu)
+            if bbox:
+                bboxes.append(bbox)
+        log.info(f"get_human_bboxes: {len(bboxes)} MOTION_HUMAN boxes in ±{window_sec}s window")
+        return bboxes
+    except Exception as e:
+        log.warning(f"get_human_bboxes failed: {e}")
+        return []
+
+
+def check_near_miss(forklift_detections: list, human_bboxes: list[tuple[int,int,int,int]],
+                    threshold: int = NEAR_MISS_THRESHOLD) -> bool:
+    """Return True if any human center falls within threshold permyriad of any forklift bbox.
+
+    Forklift detections are (label, conf, x0, y0, x1, y1, img_w, img_h) in pixel coords.
+    Human bboxes are (left, top, right, bottom) in permyriad (0–10000).
+    We convert forklift pixels → permyriad for comparison.
+    Also skips humans whose bbox center is fully inside the forklift bbox
+    (likely the operator in the cab).
+    """
+    if not human_bboxes:
+        return False
+    for _, _, x0, y0, x1, y1, img_w, img_h in forklift_detections:
+        # Convert forklift to permyriad
+        fl = int(x0 / img_w * 10000); ft = int(y0 / img_h * 10000)
+        fr = int(x1 / img_w * 10000); fb = int(y1 / img_h * 10000)
+        # Expand by threshold on each side for proximity zone
+        zl = fl - threshold; zt = ft - threshold
+        zr = fr + threshold; zb = fb + threshold
+        for (hl, ht, hr, hb) in human_bboxes:
+            hcx = (hl + hr) // 2
+            hcy = (ht + hb) // 2
+            # Skip operator in cab — human center fully inside forklift bbox
+            if fl <= hcx <= fr and ft <= hcy <= fb:
+                log.info(f"Near-miss: skipping human at ({hcx},{hcy}) — inside forklift bbox (operator in cab)")
+                continue
+            if zl <= hcx <= zr and zt <= hcy <= zb:
+                log.info(f"Near-miss detected! Human center ({hcx},{hcy}) within {threshold} permyriad of forklift ({fl},{ft})-({fr},{fb})")
+                return True
+    return False
+
+
+def log_near_miss(camera_uuid: str, timestamp_ms: int, forklift_conf: float):
+    write_header = not NEAR_MISS_LOG_FILE.exists()
+    with open(NEAR_MISS_LOG_FILE, "a", newline="") as f:
+        writer = csv.writer(f)
+        if write_header:
+            writer.writerow(["timestamp", "camera_uuid", "event_timestamp_ms", "forklift_confidence"])
+        writer.writerow([datetime.now().isoformat(), camera_uuid, timestamp_ms, f"{forklift_conf:.1%}"])
+
+
 def create_bounding_boxes(camera_uuid: str, timestamp_ms: int, detections: list):
     # API uses short key names: ts, a, l, t, r, b, c, objectId, m
     boxes = [
@@ -524,6 +623,7 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
         "latency_ms":   0,
         "reason":       "deferred fallback",
         "thumb_b64":    "",
+        "near_miss":    False,
     }
     try:
         # After 45s the pre-fetch future (started at first-ping time) is almost certainly done.
@@ -571,7 +671,16 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
         sp_resp = create_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
         bb_resp = create_bounding_boxes(camera_uuid, det_timestamp_ms, forklifts)
         log.info(f"Sweeper seekpoint: {sp_resp}  |  bbox: {bb_resp}")
-        event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf)
+
+        # Near-miss check
+        human_bboxes = get_human_bboxes(camera_uuid, det_timestamp_ms)
+        near_miss = check_near_miss(forklifts, human_bboxes)
+        if near_miss:
+            log.info(f"Sweeper NEAR-MISS on {camera_uuid}! Writing RED seekpoint.")
+            log_near_miss(camera_uuid, det_timestamp_ms, best_conf)
+            create_near_miss_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
+        event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf,
+                     near_miss=near_miss)
     finally:
         event["latency_ms"] = int((time.time() - t_start) * 1000)
         _record_event(event)
@@ -666,6 +775,7 @@ def webhook():
         "latency_ms":  0,
         "reason":      "",
         "thumb_b64":   "",
+        "near_miss":   False,
     }
 
     try:
@@ -777,8 +887,17 @@ def webhook():
         bb_resp = create_bounding_boxes(camera_uuid, det_timestamp_ms, forklifts)
         log.info(f"Seekpoint write: {sp_resp}  |  Bbox write: {bb_resp}")
 
-        event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf)
-        return jsonify({"status": "ok", "forklift": True, "count": len(forklifts)}), 200
+        # Near-miss check — query MOTION_HUMAN seekpoints near detection time
+        human_bboxes = get_human_bboxes(camera_uuid, det_timestamp_ms)
+        near_miss = check_near_miss(forklifts, human_bboxes)
+        if near_miss:
+            log.info(f"NEAR-MISS on {camera_uuid}! Writing RED seekpoint.")
+            log_near_miss(camera_uuid, det_timestamp_ms, best_conf)
+            create_near_miss_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
+        event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf,
+                     near_miss=near_miss)
+        return jsonify({"status": "ok", "forklift": True, "count": len(forklifts),
+                        "near_miss": near_miss}), 200
     finally:
         event["latency_ms"] = int((time.time() - t_start) * 1000)
         _record_event(event)
@@ -788,11 +907,12 @@ def webhook():
 def stats():
     with _EVENTS_LOCK:
         events = list(_EVENTS)
-    total      = len(events)
-    forklift_n = sum(1 for e in events if e.get("forklift"))
-    errors_n   = sum(1 for e in events if e.get("status") == "error")
-    ignored_n  = sum(1 for e in events if e.get("status") == "ignored")
-    deferred_n = sum(1 for e in events if e.get("status") == "deferred")
+    total       = len(events)
+    forklift_n  = sum(1 for e in events if e.get("forklift"))
+    near_miss_n = sum(1 for e in events if e.get("near_miss"))
+    errors_n    = sum(1 for e in events if e.get("status") == "error")
+    ignored_n   = sum(1 for e in events if e.get("status") == "ignored")
+    deferred_n  = sum(1 for e in events if e.get("status") == "deferred")
     latencies  = [e["latency_ms"] for e in events if e.get("latency_ms")]
     avg_latency = int(sum(latencies) / len(latencies)) if latencies else 0
     per_camera: dict = {}
@@ -806,6 +926,7 @@ def stats():
         "uptime_sec":   int(time.time() - _BOOT_TS),
         "total":        total,
         "forklifts":    forklift_n,
+        "near_misses":  near_miss_n,
         "errors":       errors_n,
         "ignored":      ignored_n,
         "deferred":     deferred_n,
@@ -851,6 +972,7 @@ DASHBOARD_HTML = """<!doctype html>
   .badge.deferred { background: #2a2a3a; color: #a29bfe; }
   .badge.pending { background: #2a2f3a; color: #8b97a8; }
   .badge.forklift { background: #1a3a2a; color: #2ecc71; }
+  .badge.near-miss { background: #3a1a1a; color: #e74c3c; font-weight: 700; }
   .muted { color: #6b7585; font-size: 11px; }
   .foot { margin-top: 20px; text-align: center; color: #6b7585; font-size: 11px; }
   .thumb { height: 54px; border-radius: 4px; cursor: pointer; display: block; border: 1px solid #222833; }
@@ -871,6 +993,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="label">Forklifts Detected</div><div class="value green" id="forklifts">—</div></div>
     <div class="card"><div class="label">Hit Rate</div><div class="value" id="hit_rate">—</div></div>
     <div class="card"><div class="label">Errors</div><div class="value red" id="errors">—</div></div>
+    <div class="card"><div class="label">Near-Miss Alerts</div><div class="value red" id="near_misses">—</div></div>
     <div class="card"><div class="label">Deferred (awaiting finalized)</div><div class="value" id="deferred">—</div></div>
     <div class="card"><div class="label">Avg Latency</div><div class="value" id="avg_latency">—</div></div>
     <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">—</div></div>
@@ -922,6 +1045,7 @@ async function tick() {
     document.getElementById('forklifts').textContent = d.forklifts;
     document.getElementById('hit_rate').textContent = (d.hit_rate*100).toFixed(1) + '%';
     document.getElementById('errors').textContent = d.errors;
+    document.getElementById('near_misses').textContent = d.near_misses || 0;
     document.getElementById('deferred').textContent = d.deferred;
     document.getElementById('avg_latency').textContent = d.avg_latency + ' ms';
     document.getElementById('uptime').textContent = fmtUptime(d.uptime_sec);
@@ -936,7 +1060,7 @@ async function tick() {
     evBody.innerHTML = d.events.length
       ? d.events.map(e => {
           const statusBadge = `<span class="badge ${e.status}">${e.status}</span>`;
-          const forkBadge = e.forklift ? `<span class="badge forklift">YES ×${e.count}</span>` : '—';
+          const forkBadge = e.forklift ? `<span class="badge forklift">YES ×${e.count}</span>${e.near_miss ? ' <span class="badge near-miss">⚠ NEAR-MISS</span>' : ''}` : '—';
           const conf = e.best_conf ? (e.best_conf*100).toFixed(1)+'%' : '—';
           const rowCls = e.forklift ? 'forklift' : (e.status === 'error' ? 'error' : '');
           const src = `data:image/jpeg;base64,${e.thumb_b64}`;
