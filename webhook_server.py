@@ -24,6 +24,7 @@ import concurrent.futures
 import csv
 import json
 import logging
+import math
 import os
 import shutil
 import subprocess
@@ -52,6 +53,7 @@ LOG_FILE             = Path(__file__).parent / "detections.csv"
 NEAR_MISS_LOG_FILE   = Path(__file__).parent / "near_misses.csv"
 THRESHOLD            = float(os.environ.get("CONFIDENCE_THRESHOLD", "0.70"))
 NEAR_MISS_THRESHOLD  = int(os.environ.get("NEAR_MISS_THRESHOLD", "2000"))  # permyriad proximity
+SPEED_LIMIT_MPH      = float(os.environ.get("SPEED_LIMIT_MPH", "10"))      # mph — above this gets a ORANGE seekpoint
 RHOMBUS_API_KEY      = os.environ.get("RHOMBUS_API_KEY", "")
 RHOMBUS_API          = "https://api2.rhombussystems.com/api"
 MEDIA_API            = "https://mediaapi-v2.rhombussystems.com"
@@ -434,11 +436,14 @@ def run_detection(image_path: Path, crop_permyriad: tuple[int, int, int, int] | 
 
 
 def create_seekpoint(camera_uuid: str, timestamp_ms: int, confidence: float = 0.0,
-                     location_uuid: str = ""):
+                     location_uuid: str = "", speed_mph: float | None = None):
+    desc = f"YOLO forklift detection — {confidence:.1%} confidence"
+    if speed_mph is not None:
+        desc += f" · {speed_mph:.1f} mph"
     sp = {
         "timestampMs": timestamp_ms,
         "name":        "Forklift Detection",
-        "description": f"YOLO forklift detection — {confidence:.1%} confidence",
+        "description": desc,
         "color":       "PURPLE",
     }
     if location_uuid:
@@ -456,6 +461,64 @@ def create_near_miss_seekpoint(camera_uuid: str, timestamp_ms: int,
         "name":        "Near-Miss Alert",
         "description": f"Forklift + human in close proximity — forklift conf {forklift_conf:.1%}",
         "color":       "RED",
+    }
+    if location_uuid:
+        sp["locationUuid"] = location_uuid
+    return rhombus_post("camera/createCustomFootageSeekpoints", {
+        "cameraUuid": camera_uuid,
+        "footageSeekPoints": [sp],
+    })
+
+
+def estimate_speed(timed_detections: list[tuple[tuple, int]], camera_uuid: str) -> float | None:
+    """Estimate forklift speed in mph from a sequence of (detection, timestamp_ms) pairs.
+
+    Each detection is (label, conf, x0, y0, x1, y1, img_w, img_h) in pixel coords.
+    Returns the median speed in mph across all consecutive frame pairs, or None if
+    there are fewer than 2 frames, the camera has no calibration, or all speed
+    samples are implausible (> 25 mph — forklifts physically can't go faster).
+    """
+    scale = _CAMERA_SCALES.get(camera_uuid)
+    if not scale or len(timed_detections) < 2:
+        return None
+
+    speeds = []
+    for i in range(1, len(timed_detections)):
+        det1, ts1 = timed_detections[i - 1]
+        det2, ts2 = timed_detections[i]
+        dt_sec = (ts2 - ts1) / 1000.0
+        if dt_sec <= 0:
+            continue
+        _, _, x0_1, y0_1, x1_1, y1_1, w1, h1 = det1
+        _, _, x0_2, y0_2, x1_2, y1_2, w2, h2 = det2
+        # Forklift centre in permyriad for each frame
+        cx1 = ((x0_1 + x1_1) / 2) / w1 * 10000
+        cy1 = ((y0_1 + y1_1) / 2) / h1 * 10000
+        cx2 = ((x0_2 + x1_2) / 2) / w2 * 10000
+        cy2 = ((y0_2 + y1_2) / 2) / h2 * 10000
+        dist_permyriad = math.sqrt((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2)
+        dist_inches    = dist_permyriad / scale          # permyriad ÷ (permyriad/inch)
+        dist_feet      = dist_inches / 12
+        speed_mph      = (dist_feet / dt_sec) * 3600 / 5280
+        if 0 < speed_mph < 25:                           # sanity bound
+            speeds.append(speed_mph)
+
+    if not speeds:
+        return None
+    speeds.sort()
+    mid = len(speeds) // 2
+    return speeds[mid] if len(speeds) % 2 else (speeds[mid - 1] + speeds[mid]) / 2
+
+
+def create_speed_alert_seekpoint(camera_uuid: str, timestamp_ms: int,
+                                  speed_mph: float, forklift_conf: float,
+                                  location_uuid: str = ""):
+    sp = {
+        "timestampMs": timestamp_ms,
+        "name":        "Speed Alert",
+        "description": (f"Forklift exceeded {SPEED_LIMIT_MPH:.0f} mph limit — "
+                        f"estimated {speed_mph:.1f} mph · conf {forklift_conf:.1%}"),
+        "color":       "ORANGE",
     }
     if location_uuid:
         sp["locationUuid"] = location_uuid
@@ -677,6 +740,8 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
         "reason":       "deferred fallback",
         "thumb_b64":    "",
         "near_miss":    False,
+        "speed_mph":    None,
+        "speed_alert":  False,
     }
     try:
         # After 45s the pre-fetch future (started at first-ping time) is almost certainly done.
@@ -695,10 +760,13 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
             event.update(status="error", reason="deferred: frames unavailable")
             return
         # No bbox hint — minimal ping carries no boundingBoxes.
-        forklifts: list = []
+        # Scan ALL frames to collect trajectory for speed estimation.
+        best_forklifts: list = []
+        best_conf_so_far = 0.0
         det_timestamp_ms = timestamp_ms
         total_detections = 0
         thumb_frame: Path | None = None
+        timed_detections: list[tuple[tuple, int]] = []
         for frame_idx, (frame_path, frame_ts) in enumerate(frames):
             if thumb_frame is None:
                 thumb_frame = frame_path
@@ -706,11 +774,16 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
             total_detections += len(dets)
             hits = [d for d in dets if d[0] == "forklift"]
             if hits:
-                forklifts = hits
-                det_timestamp_ms = frame_ts
-                thumb_frame = frame_path
+                frame_best = max(hits, key=lambda d: d[1])
+                timed_detections.append((frame_best, frame_ts))
+                if frame_best[1] > best_conf_so_far:
+                    best_conf_so_far = frame_best[1]
+                    best_forklifts = hits
+                    det_timestamp_ms = frame_ts
+                    thumb_frame = frame_path
                 log.info(f"Sweeper: forklift at frame ts={frame_ts} ({frame_idx + 1}/{len(frames)})")
-                break
+
+        forklifts = best_forklifts
         event["detections"] = total_detections
         if thumb_frame:
             event["thumb_b64"] = _thumbnail_b64(thumb_frame)
@@ -719,11 +792,23 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
             event.update(status="ok", forklift=False)
             return
         best_conf = max(f[1] for f in forklifts)
+
+        speed_mph = estimate_speed(timed_detections, camera_uuid)
+        if speed_mph is not None:
+            log.info(f"Sweeper speed estimate: {speed_mph:.1f} mph ({len(timed_detections)} frames)")
+
         log.info(f"Sweeper: forklift! {len(forklifts)} instance(s) at {best_conf:.1%} on {camera_uuid}")
         log_detection(camera_uuid, "", forklifts)
-        sp_resp = create_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
+        sp_resp = create_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid, speed_mph)
         bb_resp = create_bounding_boxes(camera_uuid, det_timestamp_ms, forklifts)
         log.info(f"Sweeper seekpoint: {sp_resp}  |  bbox: {bb_resp}")
+
+        # Speed alert
+        speed_alert = False
+        if speed_mph is not None and speed_mph > SPEED_LIMIT_MPH:
+            log.info(f"Sweeper SPEED ALERT on {camera_uuid}: {speed_mph:.1f} mph")
+            create_speed_alert_seekpoint(camera_uuid, det_timestamp_ms, speed_mph, best_conf, location_uuid)
+            speed_alert = True
 
         # Near-miss check
         human_bboxes = get_human_bboxes(camera_uuid, det_timestamp_ms)
@@ -733,7 +818,7 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
             log_near_miss(camera_uuid, det_timestamp_ms, best_conf)
             create_near_miss_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
         event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf,
-                     near_miss=near_miss)
+                     near_miss=near_miss, speed_mph=speed_mph, speed_alert=speed_alert)
     finally:
         event["latency_ms"] = int((time.time() - t_start) * 1000)
         _record_event(event)
@@ -855,6 +940,8 @@ def webhook():
         "reason":      "",
         "thumb_b64":   "",
         "near_miss":   False,
+        "speed_mph":   None,
+        "speed_alert": False,
     }
     frames_to_scan: list[tuple[Path, int, bool]] = []  # initialised here so finally can clean up
 
@@ -931,10 +1018,14 @@ def webhook():
             event.update(status="error", reason="media unavailable")
             return jsonify({"status": "error", "reason": "image unavailable"}), 200
 
-        forklifts: list = []
+        # Scan ALL frames — no early break — so we can compute speed from the trajectory.
+        # best_forklifts/det_timestamp_ms track the highest-confidence frame for annotations.
+        best_forklifts: list = []
+        best_conf_so_far = 0.0
         det_timestamp_ms = timestamp_ms
         total_detections = 0
         thumb_frame: Path | None = None
+        timed_detections: list[tuple[tuple, int]] = []  # (detection, ts) for speed calc
 
         for frame_idx, (frame_path, frame_ts, pre_cropped) in enumerate(frames_to_scan):
             if thumb_frame is None:
@@ -944,12 +1035,17 @@ def webhook():
             total_detections += len(dets)
             hits = [d for d in dets if d[0] == "forklift"]
             if hits:
-                forklifts = hits
-                det_timestamp_ms = frame_ts
-                thumb_frame = frame_path
-                log.info(f"Forklift found at frame ts={frame_ts} ({frame_idx + 1}/{len(frames_to_scan)})")
-                break
+                frame_best = max(hits, key=lambda d: d[1])
+                timed_detections.append((frame_best, frame_ts))
+                if frame_best[1] > best_conf_so_far:
+                    best_conf_so_far = frame_best[1]
+                    best_forklifts = hits
+                    det_timestamp_ms = frame_ts
+                    thumb_frame = frame_path
+                log.info(f"Forklift at frame ts={frame_ts} conf={frame_best[1]:.1%} "
+                         f"({frame_idx + 1}/{len(frames_to_scan)})")
 
+        forklifts = best_forklifts
         event["detections"] = total_detections
         if thumb_frame:
             event["thumb_b64"] = _thumbnail_b64(thumb_frame)
@@ -960,11 +1056,27 @@ def webhook():
             return jsonify({"status": "ok", "forklift": False}), 200
 
         best_conf = max(f[1] for f in forklifts)
+
+        # Speed estimation from multi-frame trajectory
+        speed_mph = estimate_speed(timed_detections, camera_uuid)
+        if speed_mph is not None:
+            log.info(f"Speed estimate: {speed_mph:.1f} mph ({len(timed_detections)} frames)")
+        else:
+            log.info(f"Speed: n/a (scale={'set' if camera_uuid in _CAMERA_SCALES else 'not set'}, "
+                     f"frames_with_detection={len(timed_detections)})")
+
         log.info(f"Forklift detected! {len(forklifts)} instance(s), best conf {best_conf:.1%}. Creating annotations...")
         log_detection(camera_uuid, event_uuid or "", forklifts)
-        sp_resp = create_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
+        sp_resp = create_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid, speed_mph)
         bb_resp = create_bounding_boxes(camera_uuid, det_timestamp_ms, forklifts)
         log.info(f"Seekpoint write: {sp_resp}  |  Bbox write: {bb_resp}")
+
+        # Speed alert seekpoint if above limit
+        speed_alert = False
+        if speed_mph is not None and speed_mph > SPEED_LIMIT_MPH:
+            log.info(f"SPEED ALERT on {camera_uuid}: {speed_mph:.1f} mph > {SPEED_LIMIT_MPH} mph limit")
+            create_speed_alert_seekpoint(camera_uuid, det_timestamp_ms, speed_mph, best_conf, location_uuid)
+            speed_alert = True
 
         # Near-miss check — query MOTION_HUMAN seekpoints near detection time
         human_bboxes = get_human_bboxes(camera_uuid, det_timestamp_ms)
@@ -974,9 +1086,9 @@ def webhook():
             log_near_miss(camera_uuid, det_timestamp_ms, best_conf)
             create_near_miss_seekpoint(camera_uuid, det_timestamp_ms, best_conf, location_uuid)
         event.update(status="ok", forklift=True, count=len(forklifts), best_conf=best_conf,
-                     near_miss=near_miss)
+                     near_miss=near_miss, speed_mph=speed_mph, speed_alert=speed_alert)
         return jsonify({"status": "ok", "forklift": True, "count": len(forklifts),
-                        "near_miss": near_miss}), 200
+                        "near_miss": near_miss, "speed_mph": speed_mph}), 200
     finally:
         event["latency_ms"] = int((time.time() - t_start) * 1000)
         _record_event(event)
@@ -990,8 +1102,9 @@ def stats():
         events = list(_EVENTS)
     total       = len(events)
     forklift_n  = sum(1 for e in events if e.get("forklift"))
-    near_miss_n = sum(1 for e in events if e.get("near_miss"))
-    errors_n    = sum(1 for e in events if e.get("status") == "error")
+    near_miss_n   = sum(1 for e in events if e.get("near_miss"))
+    speed_alert_n = sum(1 for e in events if e.get("speed_alert"))
+    errors_n      = sum(1 for e in events if e.get("status") == "error")
     ignored_n   = sum(1 for e in events if e.get("status") == "ignored")
     deferred_n  = sum(1 for e in events if e.get("status") == "deferred")
     latencies  = [e["latency_ms"] for e in events if e.get("latency_ms")]
@@ -1006,9 +1119,10 @@ def stats():
     return jsonify({
         "uptime_sec":   int(time.time() - _BOOT_TS),
         "total":        total,
-        "forklifts":    forklift_n,
-        "near_misses":  near_miss_n,
-        "errors":       errors_n,
+        "forklifts":      forklift_n,
+        "near_misses":    near_miss_n,
+        "speed_alerts":   speed_alert_n,
+        "errors":         errors_n,
         "ignored":      ignored_n,
         "deferred":     deferred_n,
         "avg_latency":  avg_latency,
@@ -1054,6 +1168,8 @@ DASHBOARD_HTML = """<!doctype html>
   .badge.pending { background: #2a2f3a; color: #8b97a8; }
   .badge.forklift { background: #1a3a2a; color: #2ecc71; }
   .badge.near-miss { background: #3a1a1a; color: #e74c3c; font-weight: 700; }
+  .badge.speed-alert { background: #3a2a00; color: #f39c12; font-weight: 700; }
+  tr.speed-alert { background: rgba(243, 156, 18, .10); }
   .muted { color: #6b7585; font-size: 11px; }
   .foot { margin-top: 20px; text-align: center; color: #6b7585; font-size: 11px; }
   .thumb { height: 54px; border-radius: 4px; cursor: pointer; display: block; border: 1px solid #222833; }
@@ -1075,6 +1191,7 @@ DASHBOARD_HTML = """<!doctype html>
     <div class="card"><div class="label">Hit Rate</div><div class="value" id="hit_rate">—</div></div>
     <div class="card"><div class="label">Errors</div><div class="value red" id="errors">—</div></div>
     <div class="card"><div class="label">Near-Miss Alerts</div><div class="value red" id="near_misses">—</div></div>
+    <div class="card"><div class="label">Speed Alerts</div><div class="value amber" id="speed_alerts">—</div></div>
     <div class="card"><div class="label">Deferred (awaiting finalized)</div><div class="value" id="deferred">—</div></div>
     <div class="card"><div class="label">Avg Latency</div><div class="value" id="avg_latency">—</div></div>
     <div class="card"><div class="label">Uptime</div><div class="value" id="uptime">—</div></div>
@@ -1087,9 +1204,9 @@ DASHBOARD_HTML = """<!doctype html>
 
   <h2>Recent Events</h2>
   <table><thead><tr>
-    <th>Time</th><th>Camera</th><th>Event</th><th>Status</th><th>Forklift</th><th>Conf</th><th>Dets</th><th>Latency</th><th>Reason</th><th>Frame</th>
+    <th>Time</th><th>Camera</th><th>Event</th><th>Status</th><th>Forklift</th><th>Conf</th><th>Speed</th><th>Dets</th><th>Latency</th><th>Reason</th><th>Frame</th>
   </tr></thead>
-    <tbody id="events"><tr><td colspan="10" class="muted">waiting for webhook activity…</td></tr></tbody>
+    <tbody id="events"><tr><td colspan="11" class="muted">waiting for webhook activity…</td></tr></tbody>
   </table>
 
   <div id="modal" onclick="closeModal()">
@@ -1127,6 +1244,7 @@ async function tick() {
     document.getElementById('hit_rate').textContent = (d.hit_rate*100).toFixed(1) + '%';
     document.getElementById('errors').textContent = d.errors;
     document.getElementById('near_misses').textContent = d.near_misses || 0;
+    document.getElementById('speed_alerts').textContent = d.speed_alerts || 0;
     document.getElementById('deferred').textContent = d.deferred;
     document.getElementById('avg_latency').textContent = d.avg_latency + ' ms';
     document.getElementById('uptime').textContent = fmtUptime(d.uptime_sec);
@@ -1141,12 +1259,13 @@ async function tick() {
     evBody.innerHTML = d.events.length
       ? d.events.map(e => {
           const statusBadge = `<span class="badge ${e.status}">${e.status}</span>`;
-          const forkBadge = e.forklift ? `<span class="badge forklift">YES ×${e.count}</span>${e.near_miss ? ' <span class="badge near-miss">⚠ NEAR-MISS</span>' : ''}` : '—';
+          const forkBadge = e.forklift ? `<span class="badge forklift">YES ×${e.count}</span>${e.near_miss ? ' <span class="badge near-miss">⚠ NEAR-MISS</span>' : ''}${e.speed_alert ? ' <span class="badge speed-alert">⚡ SPEED</span>' : ''}` : '—';
           const conf = e.best_conf ? (e.best_conf*100).toFixed(1)+'%' : '—';
-          const rowCls = e.forklift ? 'forklift' : (e.status === 'error' ? 'error' : '');
+          const speedCell = e.speed_mph != null ? `${e.speed_mph.toFixed(1)} mph` : '<span class="muted">—</span>';
+          const rowCls = e.speed_alert ? 'speed-alert' : (e.forklift ? 'forklift' : (e.status === 'error' ? 'error' : ''));
           const src = `data:image/jpeg;base64,${e.thumb_b64}`;
           const thumbCell = e.thumb_b64 ? `<td><img class="thumb" src="${src}" onclick="showFrame('${src}')" /></td>` : `<td class="muted">—</td>`;
-          return `<tr class="${rowCls}"><td>${fmtTime(e.received_at)}</td><td><code>${shortId(e.camera_uuid)}</code></td><td><code>${shortId(e.event_uuid)}</code></td><td>${statusBadge}</td><td>${forkBadge}</td><td>${conf}</td><td>${e.detections}</td><td>${e.latency_ms} ms</td><td class="muted">${e.reason||''}</td>${thumbCell}</tr>`;
+          return `<tr class="${rowCls}"><td>${fmtTime(e.received_at)}</td><td><code>${shortId(e.camera_uuid)}</code></td><td><code>${shortId(e.event_uuid)}</code></td><td>${statusBadge}</td><td>${forkBadge}</td><td>${conf}</td><td>${speedCell}</td><td>${e.detections}</td><td>${e.latency_ms} ms</td><td class="muted">${e.reason||''}</td>${thumbCell}</tr>`;
         }).join('')
       : '<tr><td colspan="10" class="muted">waiting for webhook activity…</td></tr>';
   } catch (e) {
