@@ -1175,11 +1175,12 @@ def calibrate_frame():
 
     Results are cached per camera for 30 s to prevent concurrent CLI subprocesses
     from spawning if the user rapidly hits the endpoint.
+    Errors are returned as plain text (not HTML) so the JS can display them cleanly.
     """
-    from flask import Response, abort
+    from flask import Response
     camera_uuid = request.args.get("camera", "")
     if not camera_uuid:
-        abort(400, "camera param required")
+        return Response("camera param required", status=400, mimetype="text/plain")
 
     now = time.time()
     with _CALIBRATE_FRAME_LOCK:
@@ -1187,10 +1188,22 @@ def calibrate_frame():
         if cached and now - cached[0] < _CALIBRATE_FRAME_TTL:
             return Response(cached[1], mimetype="image/jpeg")
 
-    ts = int(now * 1000) - 30_000  # 30s ago
-    frame = download_via_analyze(camera_uuid, ts, window_ms=10_000)
+    # Try progressively older windows — footage takes a few seconds to commit to disk.
+    # Start 60s ago with a 30s window, then fall back to 2 min ago if needed.
+    frame = None
+    for lookback_ms in (60_000, 120_000, 180_000):
+        ts = int(now * 1000) - lookback_ms
+        log.info(f"calibrate/frame: trying {camera_uuid} at -{lookback_ms//1000}s")
+        frame = download_via_analyze(camera_uuid, ts, window_ms=30_000)
+        if frame:
+            break
+
     if not frame:
-        abort(503, "Could not fetch frame — camera may be offline or footage unavailable")
+        return Response(
+            "Could not fetch frame — camera may be offline, UUID may be wrong, "
+            "or footage is unavailable. Check Cloud Run logs for details.",
+            status=503, mimetype="text/plain",
+        )
     try:
         data = frame.read_bytes()
     finally:
@@ -1310,7 +1323,12 @@ async function loadFrame() {
   ctx.fillText('Loading…', cv.width/2-30, cv.height/2);
   try {
     const r = await fetch('/calibrate/frame?camera=' + encodeURIComponent(camUuid));
-    if (!r.ok) { msg('Frame unavailable: ' + await r.text()); return; }
+    if (!r.ok) {
+      const errText = await r.text();
+      // Strip any stray HTML tags in case of unexpected error responses
+      msg('Error: ' + errText.replace(/<[^>]+>/g, '').trim().slice(0, 200));
+      return;
+    }
     const blob = await r.blob();
     const url = URL.createObjectURL(blob);
     const img = new Image();
