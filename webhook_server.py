@@ -259,7 +259,7 @@ def analyze_event_frames(camera_uuid: str, timestamp_ms: int, duration_ms: int) 
              "--start", str(timestamp_ms),
              "--end",   str(timestamp_ms + duration_ms),
              "--fill", "--raw", "--output", tmpdir],
-            env=_cli_env(), capture_output=True, text=True, timeout=90,
+            env=_cli_env(), capture_output=True, text=True, timeout=120,
         )
         manifest_path = Path(tmpdir) / "manifest.json"
         if manifest_path.exists():
@@ -477,6 +477,16 @@ def estimate_speed(timed_detections: list[tuple[tuple, int]], camera_uuid: str) 
     Returns the median speed in mph across all consecutive frame pairs, or None if
     there are fewer than 2 frames, the camera has no calibration, or all speed
     samples are implausible (> 25 mph — forklifts physically can't go faster).
+
+    Two components are computed and the larger is used for each frame pair:
+
+    • Lateral  — centre-point displacement in permyriad → inches via scale factor.
+                 Accurate when the forklift moves across the camera's field of view.
+
+    • Radial   — bbox diagonal change in permyriad → inches via the same scale factor
+                 (approximate, since the scale factor is depth-calibrated at a fixed
+                 distance, but directionally correct and catches approach/recession
+                 that is invisible to the lateral metric).
     """
     scale = _CAMERA_SCALES.get(camera_uuid)
     if not scale or len(timed_detections) < 2:
@@ -491,12 +501,22 @@ def estimate_speed(timed_detections: list[tuple[tuple, int]], camera_uuid: str) 
             continue
         _, _, x0_1, y0_1, x1_1, y1_1, w1, h1 = det1
         _, _, x0_2, y0_2, x1_2, y1_2, w2, h2 = det2
-        # Forklift centre in permyriad for each frame
+
+        # --- Lateral: forklift centre displacement in permyriad ---
         cx1 = ((x0_1 + x1_1) / 2) / w1 * 10000
         cy1 = ((y0_1 + y1_1) / 2) / h1 * 10000
         cx2 = ((x0_2 + x1_2) / 2) / w2 * 10000
         cy2 = ((y0_2 + y1_2) / 2) / h2 * 10000
-        dist_permyriad = math.sqrt((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2)
+        lateral_dist_pm = math.sqrt((cx2 - cx1) ** 2 + (cy2 - cy1) ** 2)
+
+        # --- Radial: bbox diagonal change in permyriad ---
+        # A forklift approaching/receding changes apparent size even with no lateral motion.
+        bdiag1 = math.sqrt(((x1_1 - x0_1) / w1 * 10000) ** 2 + ((y1_1 - y0_1) / h1 * 10000) ** 2)
+        bdiag2 = math.sqrt(((x1_2 - x0_2) / w2 * 10000) ** 2 + ((y1_2 - y0_2) / h2 * 10000) ** 2)
+        radial_dist_pm = abs(bdiag2 - bdiag1)
+
+        # Take whichever component implies greater movement for this frame pair
+        dist_permyriad = max(lateral_dist_pm, radial_dist_pm)
         dist_inches    = dist_permyriad / scale          # permyriad ÷ (permyriad/inch)
         dist_feet      = dist_inches / 12
         speed_mph      = (dist_feet / dt_sec) * 3600 / 5280
@@ -754,7 +774,7 @@ def _process_deferred(camera_uuid: str, timestamp_ms: int, location_uuid: str,
             except Exception as e:
                 log.warning(f"Sweeper: pre-fetch future error: {e}")
         if not frames:
-            frames = analyze_event_frames(camera_uuid, timestamp_ms, 20_000)
+            frames = analyze_event_frames(camera_uuid, timestamp_ms, 30_000)
         if not frames:
             log.warning(f"Sweeper: no frames for deferred event on {camera_uuid}")
             event.update(status="error", reason="deferred: frames unavailable")
@@ -957,7 +977,7 @@ def webhook():
         # ready) when the finalized second ping arrives, cutting ~12s off latency.
         if not event_uuid and not seekpoint_tu:
             log.info(f"Minimal payload on {camera_uuid} — deferring, pre-fetching frames in background")
-            future = _EXECUTOR.submit(analyze_event_frames, camera_uuid, timestamp_ms, 20_000)
+            future = _EXECUTOR.submit(analyze_event_frames, camera_uuid, timestamp_ms, 30_000)
             with _PENDING_LOCK:
                 _PENDING[camera_uuid] = {
                     "timestamp_ms": timestamp_ms,
